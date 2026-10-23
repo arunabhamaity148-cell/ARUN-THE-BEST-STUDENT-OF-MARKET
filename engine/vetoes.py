@@ -15,6 +15,8 @@ Both classes use ``__slots__`` and operate purely on the in-memory
 
 
 from core.state import OnlineNormalizer
+from engine.deribit_dvol import DeribitDVOLVeto
+from engine.alt_data_veto import AltDataVetoEngine
 
 # ─────────────────────────────────────────────────────────────────────
 # Pre-computed Constants

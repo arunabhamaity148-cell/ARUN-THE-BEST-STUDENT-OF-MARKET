@@ -60,6 +60,8 @@ from engine.risk import RiskCalculator
 from dispatch.telegram_bot import TelegramSignalDispatcher
 from engine.institutional_edges import InstitutionalEdgeCalculator, compute_variance_ratio
 from engine.spectral_risk import PurePythonSpectralRiskEngine
+from engine.deribit_dvol import DeribitDVOLVeto
+from engine.alt_data_veto import AltDataVetoEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -99,6 +101,8 @@ class SignalBotOrchestrator:
         "institutional_calculators",
         "spectral_risk",
         "last_kline_closes",
+        "deribit_veto",
+        "alt_data_veto",
         "_running",
     )
 
@@ -121,6 +125,10 @@ class SignalBotOrchestrator:
         )
         self.active_positions: dict[str, int] = {}
         self.last_kline_closes: dict[str, float] = {}
+
+        # Phase 6D: Alternative Data & Options Gamma Unwind Vetoes
+        self.deribit_veto: DeribitDVOLVeto = DeribitDVOLVeto()
+        self.alt_data_veto: AltDataVetoEngine = AltDataVetoEngine()
 
         # Phase 2 & 4 Vetoes
         self.spoofing_veto: SpoofingQuoteFlickerVeto = SpoofingQuoteFlickerVeto()
@@ -378,6 +386,11 @@ class SignalBotOrchestrator:
                 now_ms=now_ms,
             )
             or (not spectral_approved)
+            # Phase 6D: Alternative Data & Options Volatility Vetoes
+            or self.deribit_veto.is_gamma_unwind_active()
+            or self.alt_data_veto.is_etf_window(z_liq=z_liq)
+            or self.alt_data_veto.is_engine_congested(state.matching_engine_jitter_ring)
+            or (direction == "LONG" and self.alt_data_veto.is_stablecoin_draining(symbol))
         )
 
         # 5. Bayesian Synthesis
@@ -453,6 +466,10 @@ class SignalBotOrchestrator:
         # Start Telegram dispatcher worker
         self.dispatcher.start()
 
+        # Start Phase 6D Deribit DVOL WS and AltData poller
+        self.deribit_veto.start()
+        self.alt_data_veto.start()
+
         # Refresh macro calendar
         await self.news_engine.refresh_macro_calendar()
 
@@ -465,6 +482,8 @@ class SignalBotOrchestrator:
         self._running = False
         await self.ws_manager.stop()
         await self.dispatcher.stop()
+        await self.deribit_veto.stop()
+        await self.alt_data_veto.stop()
         await self.rest_engine.close()
         await self.news_engine.close()
         logger.info("SignalBotOrchestrator cleanly stopped.")
