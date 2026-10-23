@@ -23,6 +23,13 @@ CVD_LOOKBACK_MS: int = 500               # window for CVD direction check
 FLASH_CRASH_DECEL_THRESHOLD: float = 0.6  # 60 % deceleration to unlock
 LIQ_VELOCITY_WINDOW_MS: int = 10_000      # 10-second rolling window
 
+# Phase 3 Veto Constants
+DELEVERAGING_OI_THRESHOLD: float = -2.5    # OI contracting by > 2.5%
+NEUTRAL_FUNDING_MAX: float = 0.0001        # ±0.01% in decimal
+DELEVERAGING_ZLIQ_OVERRIDE: float = 3.5    # Z_liq > 3.5 overrides deleveraging veto
+FUNDING_BOUNDARY_MS: int = 5 * 60 * 1000   # ±5 minutes around settlement
+EXTREME_FUNDING_THRESHOLD: float = 0.0005  # ±0.05% in decimal
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 1.  Spoofing Quote-Flicker Veto
@@ -210,4 +217,161 @@ class FlashCrashKnifeCatchVeto:
             f"FlashCrashKnifeCatchVeto("
             f"decel_threshold={self._decel_threshold}, "
             f"velocity_window_ms={self._velocity_window_ms})"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 3.  Phase 3: Deleveraging Veto
+# ─────────────────────────────────────────────────────────────────────
+
+class DeleveragingVeto:
+    """Veto mean-reversion long signals during spot/perp deleveraging.
+
+    Condition
+    ---------
+    If 15m price decline + contracting OI (delta_oi_pct < -2.5%) +
+    neutral funding (|FR| <= 0.01% / 0.0001), veto mean-reversion longs,
+    UNLESS Z_liq > 3.5 (liquidation cascade exhaustion overrides).
+    """
+
+    __slots__ = (
+        "_oi_threshold",
+        "_neutral_funding_max",
+        "_zliq_override",
+    )
+
+    def __init__(
+        self,
+        oi_threshold: float = DELEVERAGING_OI_THRESHOLD,
+        neutral_funding_max: float = NEUTRAL_FUNDING_MAX,
+        zliq_override: float = DELEVERAGING_ZLIQ_OVERRIDE,
+    ) -> None:
+        self._oi_threshold = oi_threshold
+        self._neutral_funding_max = neutral_funding_max
+        self._zliq_override = zliq_override
+
+    def should_veto(
+        self,
+        is_long: bool,
+        is_counter_trend: bool,
+        price_change_pct: float,
+        delta_oi_pct: float,
+        funding_rate: float,
+        z_liq: float = 0.0,
+    ) -> bool:
+        """Return True if the mean-reversion long signal should be vetoed.
+
+        Parameters
+        ----------
+        is_long : bool
+            True if signal is buying/long.
+        is_counter_trend : bool
+            True if signal is mean-reversion / counter-trend.
+        price_change_pct : float
+            15-minute price return (negative = decline).
+        delta_oi_pct : float
+            Open interest change percentage.
+        funding_rate : float
+            Current funding rate (decimal or percentage).
+        z_liq : float
+            Current liquidation cascade exhaustion z-score.
+        """
+        # Only applies to mean-reversion long signals
+        if not (is_long and is_counter_trend):
+            return False
+
+        # Cascade exhaustion override: massive liquidation capitulation allows catch
+        if z_liq > self._zliq_override:
+            return False
+
+        # Check normalize funding rate
+        fr = funding_rate / 100.0 if abs(funding_rate) >= 0.005 else funding_rate
+
+        is_price_decline = price_change_pct < 0.0
+        is_contracting_oi = delta_oi_pct < self._oi_threshold
+        is_neutral_funding = abs(fr) <= self._neutral_funding_max
+
+        return is_price_decline and is_contracting_oi and is_neutral_funding
+
+    def __repr__(self) -> str:
+        return (
+            f"DeleveragingVeto(oi_threshold={self._oi_threshold}, "
+            f"neutral_funding_max={self._neutral_funding_max}, "
+            f"zliq_override={self._zliq_override})"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 4.  Phase 3: Funding Settlement Boundary Veto
+# ─────────────────────────────────────────────────────────────────────
+
+class FundingSettlementBoundaryVeto:
+    """Suppress signals requiring paying extreme funding near settlement.
+
+    Condition
+    ---------
+    Inspect nextFundingTime from premiumIndex. Suppress signals within
+    ±5 minutes of settlement when the position would pay extreme funding
+    (e.g., long signal when funding > +0.05%, or short when funding < -0.05%).
+    """
+
+    __slots__ = (
+        "_extreme_funding_threshold",
+        "_boundary_ms",
+    )
+
+    def __init__(
+        self,
+        extreme_funding_threshold: float = EXTREME_FUNDING_THRESHOLD,
+        boundary_ms: int = FUNDING_BOUNDARY_MS,
+    ) -> None:
+        self._extreme_funding_threshold = extreme_funding_threshold
+        self._boundary_ms = boundary_ms
+
+    def should_veto(
+        self,
+        is_long: bool,
+        funding_rate: float,
+        next_funding_time_ms: int,
+        now_ms: int,
+    ) -> bool:
+        """Return True if signal would incur punitive funding at settlement boundary.
+
+        Parameters
+        ----------
+        is_long : bool
+            True for long signal, False for short signal.
+        funding_rate : float
+            Current funding rate (decimal or percentage).
+        next_funding_time_ms : int
+            Next funding settlement timestamp in milliseconds.
+        now_ms : int
+            Current timestamp in milliseconds.
+        """
+        if next_funding_time_ms <= 0:
+            return False
+
+        # Check if within ±5 minutes of boundary
+        time_to_settlement = abs(now_ms - next_funding_time_ms)
+        if time_to_settlement > self._boundary_ms:
+            return False
+
+        # Normalize funding rate to decimal
+        fr = funding_rate / 100.0 if abs(funding_rate) >= 0.005 else funding_rate
+
+        # Longs pay funding when funding_rate > 0
+        if is_long and fr > self._extreme_funding_threshold:
+            return True
+
+        # Shorts pay funding when funding_rate < 0
+        if (not is_long) and fr < -self._extreme_funding_threshold:
+            return True
+
+        return False
+
+    def __repr__(self) -> str:
+        return (
+            f"FundingSettlementBoundaryVeto("
+            f"extreme_threshold={self._extreme_funding_threshold}, "
+            f"boundary_ms={self._boundary_ms})"
         )

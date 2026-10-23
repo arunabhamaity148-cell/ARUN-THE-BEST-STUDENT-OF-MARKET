@@ -24,8 +24,15 @@ from engine.vetoes import (
     CVD_LOOKBACK_MS,
     FLASH_CRASH_DECEL_THRESHOLD,
     LIQ_VELOCITY_WINDOW_MS,
+    DELEVERAGING_OI_THRESHOLD,
+    NEUTRAL_FUNDING_MAX,
+    DELEVERAGING_ZLIQ_OVERRIDE,
+    FUNDING_BOUNDARY_MS,
+    EXTREME_FUNDING_THRESHOLD,
     SpoofingQuoteFlickerVeto,
     FlashCrashKnifeCatchVeto,
+    DeleveragingVeto,
+    FundingSettlementBoundaryVeto,
 )
 
 
@@ -230,3 +237,206 @@ class TestFlashCrashKnifeCatchVetoLogic:
 
         velocity = veto.compute_liq_velocity(state, now_ms=now)
         assert velocity == 200_000.0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 3. DeleveragingVeto
+# ─────────────────────────────────────────────────────────────────────
+
+class TestDeleveragingVetoSlots:
+    """Verify slots enforcement."""
+
+    def test_has_slots(self) -> None:
+        assert hasattr(DeleveragingVeto, "__slots__")
+
+    def test_no_dict(self) -> None:
+        veto = DeleveragingVeto()
+        assert not hasattr(veto, "__dict__")
+
+    def test_repr(self) -> None:
+        veto = DeleveragingVeto()
+        r = repr(veto)
+        assert "DeleveragingVeto" in r
+
+
+class TestDeleveragingVetoLogic:
+    """Verify deleveraging veto rules and Z_liq override."""
+
+    def test_non_counter_trend_allowed(self) -> None:
+        veto = DeleveragingVeto()
+        # Trend-following long is allowed
+        assert veto.should_veto(
+            is_long=True,
+            is_counter_trend=False,
+            price_change_pct=-1.5,
+            delta_oi_pct=-3.0,
+            funding_rate=0.00005,
+        ) is False
+
+    def test_short_signal_allowed(self) -> None:
+        veto = DeleveragingVeto()
+        # Short signal is not vetoed by deleveraging long veto
+        assert veto.should_veto(
+            is_long=False,
+            is_counter_trend=True,
+            price_change_pct=-1.5,
+            delta_oi_pct=-3.0,
+            funding_rate=0.00005,
+        ) is False
+
+    def test_deleveraging_blocks_mean_reversion_long(self) -> None:
+        veto = DeleveragingVeto()
+        # Price declining (-1.0%), OI contracting (-3.2% < -2.5%), funding neutral (0.00005 <= 0.0001)
+        # Z_liq = 1.0 (no extreme cascade) -> VETOED
+        assert veto.should_veto(
+            is_long=True,
+            is_counter_trend=True,
+            price_change_pct=-1.0,
+            delta_oi_pct=-3.2,
+            funding_rate=0.00005,
+            z_liq=1.0,
+        ) is True
+
+    def test_zliq_override_unlocks_long(self) -> None:
+        veto = DeleveragingVeto()
+        # Same conditions, but Z_liq = 3.8 > 3.5 (capitulation exhaustion) -> UNLOCKED
+        assert veto.should_veto(
+            is_long=True,
+            is_counter_trend=True,
+            price_change_pct=-1.0,
+            delta_oi_pct=-3.2,
+            funding_rate=0.00005,
+            z_liq=3.8,
+        ) is False
+
+    def test_fails_if_price_rising(self) -> None:
+        veto = DeleveragingVeto()
+        # Price rising (+0.5%) -> not a deleveraging dump
+        assert veto.should_veto(
+            is_long=True,
+            is_counter_trend=True,
+            price_change_pct=0.5,
+            delta_oi_pct=-3.0,
+            funding_rate=0.00005,
+        ) is False
+
+    def test_fails_if_oi_not_contracting(self) -> None:
+        veto = DeleveragingVeto()
+        # OI is expanding (+1.0% >= -2.5%)
+        assert veto.should_veto(
+            is_long=True,
+            is_counter_trend=True,
+            price_change_pct=-1.0,
+            delta_oi_pct=1.0,
+            funding_rate=0.00005,
+        ) is False
+
+    def test_fails_if_funding_not_neutral(self) -> None:
+        veto = DeleveragingVeto()
+        # Funding rate is negative and extreme (-0.0003 > 0.0001 neutral threshold)
+        assert veto.should_veto(
+            is_long=True,
+            is_counter_trend=True,
+            price_change_pct=-1.0,
+            delta_oi_pct=-3.0,
+            funding_rate=-0.0003,
+        ) is False
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 4. FundingSettlementBoundaryVeto
+# ─────────────────────────────────────────────────────────────────────
+
+class TestFundingSettlementBoundaryVetoSlots:
+    """Verify slots enforcement."""
+
+    def test_has_slots(self) -> None:
+        assert hasattr(FundingSettlementBoundaryVeto, "__slots__")
+
+    def test_no_dict(self) -> None:
+        veto = FundingSettlementBoundaryVeto()
+        assert not hasattr(veto, "__dict__")
+
+    def test_repr(self) -> None:
+        veto = FundingSettlementBoundaryVeto()
+        r = repr(veto)
+        assert "FundingSettlementBoundaryVeto" in r
+
+
+class TestFundingSettlementBoundaryVetoLogic:
+    """Verify extreme funding boundary suppression."""
+
+    def test_outside_boundary_window_allowed(self) -> None:
+        veto = FundingSettlementBoundaryVeto()
+        now = 1_000_000
+        settlement = now + 10 * 60 * 1000  # 10 minutes away (> 5m boundary)
+
+        # Long with extreme funding (+0.08%) outside boundary is allowed
+        assert veto.should_veto(
+            is_long=True,
+            funding_rate=0.0008,
+            next_funding_time_ms=settlement,
+            now_ms=now,
+        ) is False
+
+    def test_inside_boundary_long_paying_extreme_funding_vetoed(self) -> None:
+        veto = FundingSettlementBoundaryVeto()
+        now = 1_000_000
+        settlement = now + 2 * 60 * 1000  # 2 minutes away (<= 5m boundary)
+
+        # Long paying > +0.05% (+0.0006) -> VETOED
+        assert veto.should_veto(
+            is_long=True,
+            funding_rate=0.0006,
+            next_funding_time_ms=settlement,
+            now_ms=now,
+        ) is True
+
+    def test_inside_boundary_short_paying_extreme_negative_funding_vetoed(self) -> None:
+        veto = FundingSettlementBoundaryVeto()
+        now = 1_000_000
+        settlement = now + 1 * 60 * 1000  # 1 minute away
+
+        # Short paying < -0.05% (-0.0007) -> VETOED
+        assert veto.should_veto(
+            is_long=False,
+            funding_rate=-0.0007,
+            next_funding_time_ms=settlement,
+            now_ms=now,
+        ) is True
+
+    def test_inside_boundary_normal_funding_allowed(self) -> None:
+        veto = FundingSettlementBoundaryVeto()
+        now = 1_000_000
+        settlement = now + 3 * 60 * 1000
+
+        # Normal funding (+0.01% / +0.0001 <= +0.0005) -> ALLOWED
+        assert veto.should_veto(
+            is_long=True,
+            funding_rate=0.0001,
+            next_funding_time_ms=settlement,
+            now_ms=now,
+        ) is False
+
+    def test_inside_boundary_receiver_allowed(self) -> None:
+        veto = FundingSettlementBoundaryVeto()
+        now = 1_000_000
+        settlement = now + 2 * 60 * 1000
+
+        # Short position receives positive funding (+0.08%) -> ALLOWED (only payers are penalized)
+        assert veto.should_veto(
+            is_long=False,
+            funding_rate=0.0008,
+            next_funding_time_ms=settlement,
+            now_ms=now,
+        ) is False
+
+    def test_zero_settlement_timestamp_allowed(self) -> None:
+        veto = FundingSettlementBoundaryVeto()
+        assert veto.should_veto(
+            is_long=True,
+            funding_rate=0.001,
+            next_funding_time_ms=0,
+            now_ms=1000,
+        ) is False
+
