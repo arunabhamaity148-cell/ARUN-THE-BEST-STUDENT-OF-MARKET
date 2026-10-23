@@ -312,3 +312,69 @@ class TestSymbolMicroStateRepr:
         r = repr(s)
         assert "SOLUSDT" in r
         assert "SymbolMicroState" in r
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SymbolMicroState — Phase 6 Spot, COIN-M & Jitter Rings
+# ─────────────────────────────────────────────────────────────────────
+
+class TestSymbolMicroStatePhase6:
+    """Verify Phase 6 ring buffers and jitter tracking."""
+
+    def test_phase6_deques_initialized(self) -> None:
+        s = SymbolMicroState("BTCUSDT")
+        assert len(s.spot_cvd_lm) == 0
+        assert len(s.spot_price_ring) == 0
+        assert len(s.coin_m_ofi_ring) == 0
+        assert len(s.matching_engine_jitter_ring) == 0
+
+    def test_jitter_ring_maxlen_is_twenty(self) -> None:
+        s = SymbolMicroState("BTCUSDT")
+        assert s.matching_engine_jitter_ring.maxlen == 20
+
+    def test_record_jitter(self) -> None:
+        s = SymbolMicroState("BTCUSDT")
+        jitter = s.record_jitter(event_time=1025.0, trade_time=1000.0)
+        assert math.isclose(jitter, 25.0)
+        assert len(s.matching_engine_jitter_ring) == 1
+        assert math.isclose(s.matching_engine_jitter_ring[0], 25.0)
+
+    def test_jitter_ring_bounded_to_twenty(self) -> None:
+        s = SymbolMicroState("BTCUSDT")
+        for i in range(30):
+            s.record_jitter(event_time=100.0 + i, trade_time=100.0)
+        assert len(s.matching_engine_jitter_ring) == 20
+        assert math.isclose(s.matching_engine_jitter_ring[-1], 29.0)
+
+    def test_update_jitter(self) -> None:
+        s = SymbolMicroState("BTCUSDT")
+        s.update_jitter(14.2)
+        assert len(s.matching_engine_jitter_ring) == 1
+        assert math.isclose(s.matching_engine_jitter_ring[0], 14.2)
+
+    def test_update_spot_trade(self) -> None:
+        s = SymbolMicroState("BTCUSDT")
+        s.update_spot_trade(price=64000.0, qty=0.5, is_buyer_maker=False, trade_time=12345)
+        assert len(s.spot_price_ring) == 1
+        assert s.spot_price_ring[-1] == 64000.0
+        assert len(s.spot_cvd_lm) == 1
+        assert s.spot_cvd_lm[-1] == (12345, 0.5)
+
+    def test_spot_cvd_1m_alias(self) -> None:
+        s = SymbolMicroState("BTCUSDT")
+        assert s.spot_cvd_1m is s.spot_cvd_lm
+        s.update_spot_trade(price=64000.0, qty=1.0, is_buyer_maker=True, trade_time=555)
+        assert s.spot_cvd_1m[-1] == (555, -1.0)
+
+    def test_update_coin_m_ofi(self) -> None:
+        s = SymbolMicroState("BTCUSDT")
+        s.update_coin_m_ofi(155.8)
+        assert len(s.coin_m_ofi_ring) == 1
+        assert math.isclose(s.coin_m_ofi_ring[-1], 155.8)
+
+    def test_update_trade_with_event_time_records_jitter(self) -> None:
+        s = SymbolMicroState("BTCUSDT")
+        s.update_trade(price=64000.0, qty=1.0, is_buyer_maker=False, trade_time=1000, event_time=1018)
+        assert len(s.matching_engine_jitter_ring) == 1
+        assert math.isclose(s.matching_engine_jitter_ring[-1], 18.0)
+

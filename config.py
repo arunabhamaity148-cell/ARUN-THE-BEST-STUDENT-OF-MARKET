@@ -4,23 +4,56 @@ config.py — Global configuration for the signal bot.
 All tunable parameters live here so nothing is hard-coded in modules.
 """
 
-# ── Symbols ──────────────────────────────────────────────────────────
-SYMBOLS: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
+# ── Symbols (10-Pair Institutional Universe) ──────────────────────────
+SYMBOLS: tuple[str, ...] = (
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "SUIUSDT",
+    "LINKUSDT",
+    "TONUSDT",
+    "AVAXUSDT",
+    "NEARUSDT",
+    "AAVEUSDT",
+    "DOGEUSDT",
+)
 
 # ── WebSocket URLs ───────────────────────────────────────────────────
+# USD-M Futures WebSocket
 WS_BASE_URL: str = "wss://fstream.binance.com/stream"
+WS_USDM_BASE_URL: str = "wss://fstream.binance.com/stream"
 
-# Per-symbol stream suffixes
+# Spot WebSocket (microsecond timestamps for aggTrade)
+WS_SPOT_BASE_URL: str = "wss://stream.binance.com:9443/stream?streams="
+SPOT_WS_BASE_URL: str = WS_SPOT_BASE_URL
+
+# COIN-M Futures WebSocket (for !bookTicker & !forceOrder@arr)
+WS_COINM_BASE_URL: str = "wss://dstream.binance.com/stream?streams="
+COINM_WS_BASE_URL: str = WS_COINM_BASE_URL
+
+# ── Stream Definitions ───────────────────────────────────────────────
+# USD-M streams
+USDM_STREAMS: tuple[str, ...] = ("depth20@100ms", "aggTrade", "kline_1m")
+GLOBAL_USDM_STREAMS: tuple[str, ...] = ("!bookTicker", "!forceOrder@arr")
+
+# Spot streams
+SPOT_STREAMS: tuple[str, ...] = ("aggTrade?timeUnit=MICROSECOND", "bookTicker")
+
+# COIN-M global streams
+COINM_STREAMS: tuple[str, ...] = ("!bookTicker", "!forceOrder@arr")
+
+# Backward-compatibility aliases for Phase 1-5 modules
 PUBLIC_STREAMS: tuple[str, ...] = ("depth20@100ms", "bookTicker")
 MARKET_STREAMS: tuple[str, ...] = ("aggTrade", "kline_1m")
-
-# Global streams (not per-symbol, prefixed with !)
 GLOBAL_MARKET_STREAMS: tuple[str, ...] = ("!forceOrder@arr",)
 
 # ── Rolling Window Sizes ────────────────────────────────────────────
 TRADE_WINDOW: int = 500       # recent trades kept per symbol
 DEPTH_WINDOW: int = 100       # depth snapshots kept per symbol
 SPREAD_WINDOW: int = 200      # spread samples kept per symbol
+SPOT_RING_WINDOW: int = 500   # recent spot prices / CVD deltas
+COINM_OFI_WINDOW: int = 100   # recent COIN-M OFI readings
+JITTER_WINDOW: int = 20       # matching engine (E - T) jitter samples
 
 # ── Reconnection ────────────────────────────────────────────────────
 RECONNECT_DELAY_INIT: float = 1.0    # seconds

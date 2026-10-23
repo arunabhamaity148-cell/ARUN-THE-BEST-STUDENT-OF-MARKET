@@ -2,7 +2,7 @@
 
 We test:
   1. Pure helper functions (build_stream_names, build_stream_url)
-  2. WSManager initialisation & URL construction
+  2. WSManager initialisation & 3 socket URL construction (USD-M, Spot, COIN-M)
   3. Message dispatch with a mocked WebSocket
   4. Reconnection back-off logic
 """
@@ -25,6 +25,8 @@ from ingestion.ws_manager import (
 from config import (
     SYMBOLS,
     WS_BASE_URL,
+    WS_SPOT_BASE_URL,
+    WS_COINM_BASE_URL,
     PUBLIC_STREAMS,
     MARKET_STREAMS,
     GLOBAL_MARKET_STREAMS,
@@ -87,6 +89,10 @@ class TestBuildStreamUrl:
         url = build_stream_url(WS_BASE_URL, ["btcusdt@aggTrade"])
         assert url.startswith("wss://fstream.binance.com/stream?streams=")
 
+    def test_base_url_with_query_prefix(self) -> None:
+        url = build_stream_url("wss://stream.binance.com:9443/stream?streams=", ["a@b", "c@d"])
+        assert url == "wss://stream.binance.com:9443/stream?streams=a@b/c@d"
+
 
 # ─────────────────────────────────────────────────────────────────────
 # WSManager — Slots
@@ -103,7 +109,7 @@ class TestWSManagerSlots:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# WSManager — Initialization
+# WSManager — Initialization & 3 Socket URLs
 # ─────────────────────────────────────────────────────────────────────
 
 class TestWSManagerInit:
@@ -111,6 +117,7 @@ class TestWSManagerInit:
     def test_default_symbols(self) -> None:
         mgr = WSManager()
         assert mgr.symbols == SYMBOLS
+        assert len(mgr.symbols) == 10
 
     def test_custom_symbols(self) -> None:
         mgr = WSManager(symbols=("XRPUSDT",))
@@ -120,36 +127,49 @@ class TestWSManagerInit:
         mgr = WSManager()
         assert mgr.is_running is False
 
-    def test_public_url_contains_depth(self) -> None:
+    # ── 1. USD-M Socket URL ──
+    def test_usdm_url_contains_expected_streams(self) -> None:
         mgr = WSManager(symbols=("BTCUSDT",))
-        assert "depth20@100ms" in mgr.public_url
+        assert "depth20@100ms" in mgr.usdm_url
+        assert "btcusdt@aggTrade" in mgr.usdm_url
+        assert "btcusdt@kline_1m" in mgr.usdm_url
+        assert "!bookTicker" in mgr.usdm_url
+        assert "!forceOrder@arr" in mgr.usdm_url
+        assert mgr.usdm_url.startswith("wss://fstream.binance.com/stream?streams=")
 
-    def test_public_url_contains_book_ticker(self) -> None:
+    def test_public_and_market_url_aliases(self) -> None:
         mgr = WSManager(symbols=("BTCUSDT",))
-        assert "bookTicker" in mgr.public_url
+        assert mgr.public_url == mgr.usdm_url
+        assert mgr.market_url == mgr.usdm_url
 
-    def test_market_url_contains_agg_trade(self) -> None:
-        mgr = WSManager(symbols=("BTCUSDT",))
-        assert "aggTrade" in mgr.market_url
+    # ── 2. Spot Socket URL ──
+    def test_spot_url_contains_expected_streams(self) -> None:
+        mgr = WSManager(symbols=("BTCUSDT", "ETHUSDT"))
+        assert "btcusdt@aggTrade?timeUnit=MICROSECOND" in mgr.spot_url
+        assert "btcusdt@bookTicker" in mgr.spot_url
+        assert "ethusdt@aggTrade?timeUnit=MICROSECOND" in mgr.spot_url
+        assert "ethusdt@bookTicker" in mgr.spot_url
+        assert "stream.binance.com:9443" in mgr.spot_url
 
-    def test_market_url_contains_kline(self) -> None:
-        mgr = WSManager(symbols=("BTCUSDT",))
-        assert "kline_1m" in mgr.market_url
+    # ── 3. COIN-M Socket URL ──
+    def test_coinm_url_contains_expected_streams(self) -> None:
+        mgr = WSManager()
+        assert "!bookTicker" in mgr.coinm_url
+        assert "!forceOrder@arr" in mgr.coinm_url
+        assert "dstream.binance.com" in mgr.coinm_url
 
-    def test_market_url_contains_force_order(self) -> None:
-        mgr = WSManager(symbols=("BTCUSDT",))
-        assert "forceOrder" in mgr.market_url
-
-    def test_all_symbols_in_public_url(self) -> None:
-        mgr = WSManager(symbols=("BTCUSDT", "ETHUSDT", "SOLUSDT"))
-        for sym in ("btcusdt", "ethusdt", "solusdt"):
-            assert sym in mgr.public_url
+    def test_all_ten_symbols_in_usdm_and_spot_url(self) -> None:
+        mgr = WSManager()
+        for sym in SYMBOLS:
+            assert sym.lower() in mgr.usdm_url
+            assert sym.lower() in mgr.spot_url
 
     def test_repr(self) -> None:
         mgr = WSManager(symbols=("BTCUSDT",))
         r = repr(mgr)
         assert "WSManager" in r
         assert "stopped" in r
+        assert "3 sockets" in r
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -169,16 +189,13 @@ class TestWSManagerMessageDispatch:
 
         mgr = WSManager(symbols=("BTCUSDT",), on_message=on_msg)
 
-        # Build a fake payload Binance-style
         payload = {"stream": "btcusdt@aggTrade", "data": {"p": "50000.0"}}
         raw_bytes = orjson.dumps(payload)
 
-        # Simulate: create a mock async-iterable WebSocket
         mock_ws = AsyncMock()
         mock_ws.__aenter__ = AsyncMock(return_value=mock_ws)
         mock_ws.__aexit__ = AsyncMock(return_value=False)
 
-        # The async for loop needs __aiter__ → returns self, __anext__ → yields frames
         call_count = 0
 
         async def fake_aiter(self_ws):
@@ -186,8 +203,6 @@ class TestWSManagerMessageDispatch:
             if call_count == 0:
                 call_count += 1
                 yield raw_bytes
-            # After first yield, manager loop waits for next frame;
-            # we stop running to exit cleanly
             mgr._running = False
 
         mock_ws.__aiter__ = lambda self_ws: fake_aiter(self_ws)
@@ -195,8 +210,7 @@ class TestWSManagerMessageDispatch:
         with patch("ingestion.ws_manager.ws_client") as mock_ws_client:
             mock_ws_client.connect.return_value = mock_ws
             mgr._running = True
-            # Run listener directly (don't use start() — we only test one)
-            await mgr._listen(mgr.public_url, "test")
+            await mgr._listen(mgr.usdm_url, "test")
 
         assert len(received) == 1
         assert received[0]["stream"] == "btcusdt@aggTrade"
@@ -231,7 +245,7 @@ class TestWSManagerMessageDispatch:
         with patch("ingestion.ws_manager.ws_client") as mock_ws_client:
             mock_ws_client.connect.return_value = mock_ws
             mgr._running = True
-            await mgr._listen(mgr.public_url, "test")
+            await mgr._listen(mgr.spot_url, "test")
 
         assert len(received) == 1
         assert received[0]["stream"] == "btcusdt@bookTicker"
@@ -255,25 +269,20 @@ class TestOrjsonRawBytesRule:
         assert result == {"a": 1}
 
     def test_no_decode_in_source(self) -> None:
-        """Grep ws_manager source — .decode() must not appear in the
-        message-handling hot path."""
+        """Grep ws_manager source — .decode() must not appear in the hot path."""
         import inspect
         from ingestion import ws_manager
 
         source = inspect.getsource(ws_manager)
-        # Check only executable lines — skip comments, docstrings, and
-        # plain-text lines inside triple-quoted strings.
         lines = source.split("\n")
         in_docstring = False
         for line in lines:
             stripped = line.lstrip()
-            # Toggle docstring state on triple-quote boundaries
             triple_count = stripped.count('"""')
             if triple_count == 1:
                 in_docstring = not in_docstring
                 continue
             if triple_count >= 2:
-                # Opening and closing on same line — skip it
                 continue
             if in_docstring or stripped.startswith("#"):
                 continue
@@ -283,7 +292,7 @@ class TestOrjsonRawBytesRule:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# WSManager — start / stop lifecycle
+# WSManager — start / stop lifecycle (3 sockets)
 # ─────────────────────────────────────────────────────────────────────
 
 class TestWSManagerLifecycle:
@@ -293,11 +302,10 @@ class TestWSManagerLifecycle:
         mgr = WSManager(symbols=("BTCUSDT",))
 
         with patch("ingestion.ws_manager.ws_client") as mock_ws_client:
-            # Make connect raise immediately to avoid hanging
             mock_ws_client.connect.side_effect = ConnectionError("test")
             await mgr.start()
             assert mgr.is_running is True
-            # Clean up
+            assert len(mgr._tasks) == 3
             await mgr.stop()
             assert mgr.is_running is False
 
@@ -308,6 +316,6 @@ class TestWSManagerLifecycle:
         with patch("ingestion.ws_manager.ws_client") as mock_ws_client:
             mock_ws_client.connect.side_effect = ConnectionError("test")
             await mgr.start()
-            assert len(mgr._tasks) == 2
+            assert len(mgr._tasks) == 3
             await mgr.stop()
             assert len(mgr._tasks) == 0

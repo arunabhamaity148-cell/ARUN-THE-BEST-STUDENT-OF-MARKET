@@ -1,12 +1,13 @@
 """
-ingestion/ws_manager.py — Dual-WebSocket manager for Binance Futures.
+ingestion/ws_manager.py — Triple-WebSocket manager for Binance (USD-M, Spot, COIN-M).
 
 Architecture
 ------------
-Two independent WebSocket connections with exponential back-off reconnect:
+Three independent WebSocket connections with exponential back-off reconnect:
 
-  Public  → depth20@100ms, bookTicker   (order-book state)
-  Market  → aggTrade, kline_1m, !forceOrder@arr  (trade / liquidation flow)
+  1. USD-M  → depth20@100ms, aggTrade, kline_1m, !bookTicker, !forceOrder@arr
+  2. Spot   → aggTrade?timeUnit=MICROSECOND, bookTicker (lead-lag discovery)
+  3. COIN-M → !bookTicker, !forceOrder@arr (cross-margin collateral stress)
 
 Raw bytes are passed directly to orjson.loads() — no .decode('utf-8').
 """
@@ -27,9 +28,8 @@ except ImportError:          # allow import in test envs without websockets
 from config import (
     SYMBOLS,
     WS_BASE_URL,
-    PUBLIC_STREAMS,
-    MARKET_STREAMS,
-    GLOBAL_MARKET_STREAMS,
+    WS_SPOT_BASE_URL,
+    WS_COINM_BASE_URL,
     RECONNECT_DELAY_INIT,
     RECONNECT_DELAY_MAX,
     RECONNECT_MULTIPLIER,
@@ -67,29 +67,43 @@ def build_stream_url(
     'wss://example.com/stream?streams=a@b/c@d'
     """
     joined = "/".join(stream_names)
+    if base_url.endswith("?streams="):
+        return f"{base_url}{joined}"
+    elif "?streams=" in base_url:
+        sep = "/" if not base_url.endswith("/") and not base_url.endswith("=") else ""
+        return f"{base_url}{sep}{joined}"
     return f"{base_url}?streams={joined}"
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Dual-WebSocket Manager
+# Triple-WebSocket Manager (USD-M, Spot, COIN-M)
 # ─────────────────────────────────────────────────────────────────────
 
 class WSManager:
-    """Manages two concurrent WebSocket connections to Binance Futures.
+    """Manages three concurrent WebSocket connections to Binance.
 
     Parameters
     ----------
     symbols : tuple[str, ...]
-        Uppercase symbol names (e.g. ``("BTCUSDT",)``).
+        Uppercase symbol names (e.g. ``("BTCUSDT", ...)``).
     base_url : str
-        WebSocket base URL (``wss://fstream.binance.com/stream``).
-    on_message : MessageCallback
+        USD-M WebSocket base URL.
+    on_message : MessageCallback | None
         Async callable invoked with each parsed JSON dict.
+    spot_base_url : str
+        Spot WebSocket base URL.
+    coinm_base_url : str
+        COIN-M WebSocket base URL.
     """
 
     __slots__ = (
         "_symbols",
         "_base_url",
+        "_spot_base_url",
+        "_coinm_base_url",
+        "_usdm_url",
+        "_spot_url",
+        "_coinm_url",
         "_public_url",
         "_market_url",
         "_on_message",
@@ -102,18 +116,42 @@ class WSManager:
         symbols: tuple[str, ...] = SYMBOLS,
         base_url: str = WS_BASE_URL,
         on_message: MessageCallback | None = None,
+        spot_base_url: str = WS_SPOT_BASE_URL,
+        coinm_base_url: str = WS_COINM_BASE_URL,
     ) -> None:
         self._symbols = symbols
         self._base_url = base_url
+        self._spot_base_url = spot_base_url
+        self._coinm_base_url = coinm_base_url
         self._on_message: MessageCallback = on_message or self._noop
 
-        # Build the two combined-stream URLs
-        public_names = build_stream_names(symbols, PUBLIC_STREAMS)
-        market_names = build_stream_names(symbols, MARKET_STREAMS)
-        market_names.extend(GLOBAL_MARKET_STREAMS)
+        # 1. USD-M Socket: @depth20@100ms, @aggTrade, @kline_1m, !bookTicker, !forceOrder@arr
+        usdm_names: list[str] = []
+        for sym in symbols:
+            s_low = sym.lower()
+            usdm_names.append(f"{s_low}@depth20@100ms")
+            usdm_names.append(f"{s_low}@aggTrade")
+            usdm_names.append(f"{s_low}@kline_1m")
+        usdm_names.append("!bookTicker")
+        usdm_names.append("!forceOrder@arr")
 
-        self._public_url: str = build_stream_url(base_url, public_names)
-        self._market_url: str = build_stream_url(base_url, market_names)
+        self._usdm_url: str = build_stream_url(base_url, usdm_names)
+        # Legacy aliases for backward compatibility
+        self._public_url: str = self._usdm_url
+        self._market_url: str = self._usdm_url
+
+        # 2. Spot Socket: @aggTrade (?timeUnit=MICROSECOND) and @bookTicker
+        spot_names: list[str] = []
+        for sym in symbols:
+            s_low = sym.lower()
+            spot_names.append(f"{s_low}@aggTrade?timeUnit=MICROSECOND")
+            spot_names.append(f"{s_low}@bookTicker")
+
+        self._spot_url: str = build_stream_url(spot_base_url, spot_names)
+
+        # 3. COIN-M Socket: !bookTicker and !forceOrder@arr
+        coinm_names: list[str] = ["!bookTicker", "!forceOrder@arr"]
+        self._coinm_url: str = build_stream_url(coinm_base_url, coinm_names)
 
         self._running: bool = False
         self._tasks: list[asyncio.Task] = []
@@ -176,25 +214,29 @@ class WSManager:
     # ── lifecycle ───────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Launch both WebSocket listeners as background tasks."""
+        """Launch all three WebSocket listeners as background tasks."""
         self._running = True
         self._tasks = [
             asyncio.create_task(
-                self._listen(self._public_url, "public"),
-                name="ws-public",
+                self._listen(self._usdm_url, "usdm"),
+                name="ws-usdm",
             ),
             asyncio.create_task(
-                self._listen(self._market_url, "market"),
-                name="ws-market",
+                self._listen(self._spot_url, "spot"),
+                name="ws-spot",
+            ),
+            asyncio.create_task(
+                self._listen(self._coinm_url, "coinm"),
+                name="ws-coinm",
             ),
         ]
         logger.info(
-            "WSManager started — %d symbols, 2 connections",
+            "WSManager started — %d symbols, 3 connections (USD-M, Spot, COIN-M)",
             len(self._symbols),
         )
 
     async def stop(self) -> None:
-        """Cancel both listeners and wait for clean shutdown."""
+        """Cancel all 3 listeners and wait for clean shutdown."""
         self._running = False
         for task in self._tasks:
             task.cancel()
@@ -207,6 +249,18 @@ class WSManager:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def usdm_url(self) -> str:
+        return self._usdm_url
+
+    @property
+    def spot_url(self) -> str:
+        return self._spot_url
+
+    @property
+    def coinm_url(self) -> str:
+        return self._coinm_url
 
     @property
     def public_url(self) -> str:
@@ -222,4 +276,4 @@ class WSManager:
 
     def __repr__(self) -> str:
         status = "running" if self._running else "stopped"
-        return f"WSManager({status}, symbols={self._symbols})"
+        return f"WSManager({status}, symbols={self._symbols}, 3 sockets)"

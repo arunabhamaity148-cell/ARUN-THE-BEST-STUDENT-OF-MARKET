@@ -164,8 +164,8 @@ class SignalBotOrchestrator:
                     self.liquidity_veto.update_depth(d5)
 
         # 2. BookTicker (best bid & ask)
-        elif "@bookTicker" in stream:
-            symbol = stream.split("@")[0].upper()
+        elif "bookTicker" in stream:
+            symbol = stream.split("@")[0].upper() if "@" in stream else payload.get("s", "").upper()
             state = self.states.get(symbol)
             if state is not None:
                 bid = float(payload.get("b", 0.0))
@@ -174,8 +174,8 @@ class SignalBotOrchestrator:
                 ask_qty = float(payload.get("A", 0.0))
                 state.update_book_ticker(bid, bid_qty, ask, ask_qty)
 
-        # 3. AggTrade (realized taker flow)
-        elif "@aggTrade" in stream:
+        # 3. AggTrade (realized taker flow — Spot or USD-M)
+        elif "aggTrade" in stream:
             symbol = stream.split("@")[0].upper()
             state = self.states.get(symbol)
             if state is not None:
@@ -183,10 +183,17 @@ class SignalBotOrchestrator:
                 qty = float(payload.get("q", 0.0))
                 is_buyer_maker = bool(payload.get("m", False))
                 trade_time = int(payload.get("T", now_ms))
-                state.update_trade(price, qty, is_buyer_maker, trade_time)
+                event_time = payload.get("E")
+                e_int = int(event_time) if event_time is not None else None
 
-                # Check edge evaluation on trade flow
-                await self._evaluate_symbol_edges(symbol, now_ms)
+                if "timeUnit=MICROSECOND" in stream:
+                    # Spot lead-lag trade
+                    state.update_spot_trade(price, qty, is_buyer_maker, trade_time)
+                else:
+                    # USD-M primary trade (tracks E - T jitter)
+                    state.update_trade(price, qty, is_buyer_maker, trade_time, event_time=e_int)
+                    # Check edge evaluation on trade flow
+                    await self._evaluate_symbol_edges(symbol, now_ms)
 
         # 4. Liquidation Orders (!forceOrder@arr)
         elif "forceOrder" in stream:

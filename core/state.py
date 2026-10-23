@@ -15,6 +15,7 @@ from config import (
     TRADE_WINDOW, DEPTH_WINDOW, SPREAD_WINDOW,
     OFI_WINDOW, LIQ_EVENT_WINDOW, ABSORPTION_SNAP_WINDOW,
     TRADE_DELTA_WINDOW,
+    SPOT_RING_WINDOW, COINM_OFI_WINDOW, JITTER_WINDOW,
 )
 
 
@@ -145,6 +146,11 @@ class SymbolMicroState:
         # ── absorption divergence (Phase 2) ──
         "absorption_snapshots",
         "last_absorption_snap_time",
+        # ── Phase 6: Spot, COIN-M & Jitter Rings ──
+        "spot_cvd_lm",
+        "spot_price_ring",
+        "coin_m_ofi_ring",
+        "matching_engine_jitter_ring",
     )
 
     def __init__(self, symbol: str) -> None:
@@ -198,6 +204,23 @@ class SymbolMicroState:
         self.absorption_snapshots: deque = deque(maxlen=ABSORPTION_SNAP_WINDOW)
         self.last_absorption_snap_time: int = 0
 
+        # Phase 6: Spot and COIN-M rolling deques & Jitter ring (max 20)
+        self.spot_cvd_lm: deque = deque(maxlen=SPOT_RING_WINDOW)
+        self.spot_price_ring: deque = deque(maxlen=SPOT_RING_WINDOW)
+        self.coin_m_ofi_ring: deque = deque(maxlen=COINM_OFI_WINDOW)
+        self.matching_engine_jitter_ring: deque = deque(maxlen=JITTER_WINDOW)
+
+    # ── convenience properties ──────────────────────────────────────
+
+    @property
+    def spot_cvd_1m(self) -> deque:
+        """Alias for spot_cvd_lm supporting both 1m and lm conventions."""
+        return self.spot_cvd_lm
+
+    @spot_cvd_1m.setter
+    def spot_cvd_1m(self, value: deque) -> None:
+        self.spot_cvd_lm = value
+
     # ── convenience mutators ────────────────────────────────────────
 
     def update_book_ticker(
@@ -223,6 +246,7 @@ class SymbolMicroState:
         qty: float,
         is_buyer_maker: bool,
         trade_time: int,
+        event_time: int | None = None,
     ) -> None:
         """Update state from an aggTrade event.
 
@@ -231,6 +255,10 @@ class SymbolMicroState:
         is_buyer_maker : bool
             True  → seller-initiated (taker sold into bid)
             False → buyer-initiated (taker bought at ask)
+        trade_time : int
+            Matching engine timestamp T.
+        event_time : int | None
+            WebSocket event timestamp E (tracks E - T jitter).
         """
         self.last_price = price
         self.last_trade_time = trade_time
@@ -251,6 +279,10 @@ class SymbolMicroState:
         self.cvd_normalizer.update(self.cvd)
         self.volume_normalizer.update(qty)
 
+        # Track matching engine jitter E - T if event_time provided
+        if event_time is not None:
+            self.record_jitter(event_time, trade_time)
+
     def update_depth(
         self,
         total_bid_depth: float,
@@ -265,6 +297,34 @@ class SymbolMicroState:
     def add_liquidation(self, timestamp_ms: int, notional: float) -> None:
         """Record a forced-liquidation event."""
         self.liq_events.append((timestamp_ms, notional))
+
+    # ── Phase 6 mutators ──────────────────────────────────────────────
+
+    def record_jitter(self, event_time: float, trade_time: float) -> float:
+        """Record matching engine latency jitter (E - T)."""
+        jitter = float(event_time - trade_time)
+        self.matching_engine_jitter_ring.append(jitter)
+        return jitter
+
+    def update_jitter(self, jitter: float) -> None:
+        """Record pre-computed jitter float into ring."""
+        self.matching_engine_jitter_ring.append(float(jitter))
+
+    def update_spot_trade(
+        self,
+        price: float,
+        qty: float,
+        is_buyer_maker: bool,
+        trade_time: int,
+    ) -> None:
+        """Update spot price and spot CVD."""
+        self.spot_price_ring.append(price)
+        delta = -qty if is_buyer_maker else qty
+        self.spot_cvd_lm.append((trade_time, delta))
+
+    def update_coin_m_ofi(self, ofi_val: float) -> None:
+        """Record COIN-M OFI reading."""
+        self.coin_m_ofi_ring.append(float(ofi_val))
 
     # ── derived metrics ─────────────────────────────────────────────
 
