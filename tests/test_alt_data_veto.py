@@ -148,8 +148,8 @@ class TestDefiLlamaStablecoins:
         assert engine.is_stablecoin_draining("ETHUSDT") is False
 
     @pytest.mark.asyncio
-    async def test_fetch_defillama_rest_mock(self) -> None:
-        engine = AltDataVetoEngine()
+    async def test_fetch_defillama_rest_mock(self, tmp_path) -> None:
+        engine = AltDataVetoEngine(cache_dir=str(tmp_path))
         mock_payload = [
             {"name": "Solana", "change_1d": -2.5},
             {"name": "Sui", "change_1d": 0.8},
@@ -182,9 +182,9 @@ class TestDefiLlamaStablecoins:
         assert engine.is_stablecoin_draining("SUIUSDT") is False
 
     @pytest.mark.asyncio
-    async def test_fetch_defillama_live_schema_mock(self) -> None:
+    async def test_fetch_defillama_live_schema_mock(self, tmp_path) -> None:
         """Test DefiLlama's actual production schema: list of {'name': ..., 'totalCirculatingUSD': {'peggedUSD': ...}}."""
-        engine = AltDataVetoEngine()
+        engine = AltDataVetoEngine(cache_dir=str(tmp_path))
 
         # Frame 1: Baseline supply
         payload_1 = (

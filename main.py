@@ -66,6 +66,7 @@ from engine.institutional_edges import (
 from engine.spectral_risk import PurePythonSpectralRiskEngine
 from engine.deribit_dvol import DeribitDVOLVeto
 from engine.alt_data_veto import AltDataVetoEngine
+from dispatch.telegram_commands import TelegramCommandHandler, TelegramCommandPoller
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,6 +108,10 @@ class SignalBotOrchestrator:
         "last_kline_closes",
         "deribit_veto",
         "alt_data_veto",
+        "start_time",
+        "last_signal_payload",
+        "command_handler",
+        "command_poller",
         "_running",
     )
 
@@ -161,6 +166,15 @@ class SignalBotOrchestrator:
 
         self.active_signals: set[str] = set()
         self._running: bool = False
+        self.start_time: float = time.time()
+        self.last_signal_payload: dict | None = None
+
+        # Phase 8: Telegram Command Dashboard
+        self.command_handler: TelegramCommandHandler = TelegramCommandHandler(self)
+        self.command_poller: TelegramCommandPoller = TelegramCommandPoller(
+            self.command_handler,
+            self.dispatcher,
+        )
 
         # Phase 1: Dual-WS Manager
         self.ws_manager: WSManager = WSManager(
@@ -530,7 +544,121 @@ class SignalBotOrchestrator:
             )
             self.active_signals.add(symbol)
             self.active_positions[symbol] = cand_dir
+            self.last_signal_payload = signal_payload
             await self.dispatcher.enqueue_signal(signal_payload)
+
+    # ── Signal Synthesis & Execution Pipeline ────────────────────────
+
+    def get_symbol_z_scores(self, symbol: str) -> dict[str, float]:
+        """Compute all 11 microstructure edge Z-scores for a symbol."""
+        state = self.states.get(symbol)
+        if state is None:
+            return {}
+
+        now_ms = int(time.time() * 1000)
+        calc = self.institutional_calculators.get(symbol)
+
+        # 1. L5 OFI
+        latest_ofi = state.ofi_history[-1] if state.ofi_history else 0.0
+        z_ofi = 2.5 if latest_ofi > 0 else (-2.5 if latest_ofi < 0 else 0.0)
+
+        # 2. CVD Absorption
+        absorption = compute_absorption_score(state, now_ms)
+        z_cvd = max(-4.0, min(4.0, absorption))
+
+        # 3. Liquidation Exhaustion
+        z_liq = state.liq_normalizer.z_score(
+            state.liq_velocity_peak if state.liq_velocity_peak > 0 else 0.0
+        )
+
+        # 4. Micro-Price displacement
+        micro_bps = compute_micro_spread_bps(
+            state.best_bid, state.best_bid_qty,
+            state.best_ask, state.best_ask_qty,
+        )
+        z_micro = max(-4.0, min(4.0, micro_bps / 2.0))
+
+        # 5. OI & Basis
+        cached_oi = getattr(self.rest_engine, "_cached_delta_oi", {}).get(symbol, 0.0) if hasattr(self.rest_engine, "_cached_delta_oi") else 0.0
+        z_oi = max(-4.0, min(4.0, cached_oi / 1.5))
+
+        # 6. SMT Divergence
+        z_smt = 0.0
+        if symbol != "BTCUSDT" and "BTCUSDT" in self.states:
+            btc_price = self.states["BTCUSDT"].mid_price
+            curr_price = state.mid_price
+            direction = "LONG" if z_ofi >= 0 else "SHORT"
+            if direction == "LONG":
+                _, smt_score = self.smt_detector.check_bullish_smt("BTCUSDT", symbol, btc_price, curr_price)
+            else:
+                _, smt_score = self.smt_detector.check_bearish_smt("BTCUSDT", symbol, btc_price, curr_price)
+            z_smt = max(-4.0, min(4.0, smt_score * 2.0))
+
+        # 7. Hawkes Cascade
+        if state.hawkes_peak_ring:
+            peak_h = max(state.hawkes_peak_ring)
+            z_hawkes = max(-4.0, min(4.0, (peak_h / 0.05) * 0.1))
+        else:
+            z_hawkes = 0.0
+
+        # 8. Iceberg / Ghost Liquidity
+        ghost_sum = sum(state.ghost_vol_ring)
+        exec_sum = sum(state.exec_vol_ring)
+        g_t = compute_iceberg_ratio(ghost_sum, exec_sum)
+        z_vol = calc.agg_vol_30s_normalizer.z_score(exec_sum) if calc is not None else 0.0
+        if g_t >= 0.68 and z_vol > 0.0:
+            z_iceberg = max(-4.0, min(4.0, max(z_vol, g_t * 3.5)))
+        elif g_t > 0.0:
+            z_iceberg = max(-4.0, min(4.0, g_t * 3.0))
+        else:
+            z_iceberg = 0.0
+
+        # 9. Spot-to-Perp Lead-Lag
+        if calc is not None:
+            spot_p = state.spot_price_ring[-1] if state.spot_price_ring else state.mid_price
+            perp_p = state.mid_price
+            score_lead, _ = calc.update_lead_lag(state, spot_p, perp_p, now_ms)
+            z_lead_lag = max(-4.0, min(4.0, score_lead))
+        else:
+            z_lead_lag = 0.0
+
+        # 10. COIN-M Stress
+        if calc is not None:
+            psi_stress, _, _ = calc.compute_collateral_stress(
+                bid_cm=state.best_bid, ask_cm=state.best_ask,
+                bid_qty_cm=state.best_bid_qty, ask_qty_cm=state.best_ask_qty,
+                bid_um=state.best_bid, ask_um=state.best_ask,
+                bid_qty_um=state.best_bid_qty, ask_qty_um=state.best_ask_qty,
+            )
+            z_coinm_stress = max(-4.0, min(4.0, psi_stress))
+        else:
+            z_coinm_stress = 0.0
+
+        # 11. Variance Ratio
+        if calc is not None and len(calc.kline_closes) >= 7:
+            vr = compute_variance_ratio(calc.kline_closes)
+            if vr >= 1.18:
+                z_vr = max(-4.0, min(4.0, (vr - 1.0) * 8.0))
+            elif vr <= 0.85:
+                z_vr = max(-4.0, min(4.0, (1.0 - vr) * 8.0))
+            else:
+                z_vr = max(-4.0, min(4.0, abs(vr - 1.0) * 5.0))
+        else:
+            z_vr = 0.0
+
+        return {
+            "z_ofi": z_ofi,
+            "z_cvd": z_cvd,
+            "z_liq": z_liq,
+            "z_oi": z_oi,
+            "z_smt": z_smt,
+            "z_micro": z_micro,
+            "z_hawkes": z_hawkes,
+            "z_iceberg": z_iceberg,
+            "z_lead_lag": z_lead_lag,
+            "z_coinm_stress": z_coinm_stress,
+            "z_vr": z_vr,
+        }
 
     # ── Lifecycle ───────────────────────────────────────────────────
 
@@ -539,8 +667,9 @@ class SignalBotOrchestrator:
         self._running = True
         logger.info("Starting SignalBotOrchestrator across %d symbols", len(self.symbols))
 
-        # Start Telegram dispatcher worker
+        # Start Telegram dispatcher worker and command poller
         self.dispatcher.start()
+        self.command_poller.start()
 
         # Start Phase 6D Deribit DVOL WS and AltData poller
         self.deribit_veto.start()
@@ -556,6 +685,7 @@ class SignalBotOrchestrator:
         """Gracefully stop all pipeline services."""
         logger.info("Stopping SignalBotOrchestrator...")
         self._running = False
+        await self.command_poller.stop()
         await self.ws_manager.stop()
         await self.dispatcher.stop()
         await self.deribit_veto.stop()
