@@ -54,6 +54,13 @@ SPREAD_WINDOW: int = 200      # spread samples kept per symbol
 SPOT_RING_WINDOW: int = 500   # recent spot prices / CVD deltas
 COINM_OFI_WINDOW: int = 100   # recent COIN-M OFI readings
 JITTER_WINDOW: int = 20       # matching engine (E - T) jitter samples
+HAWKES_PEAK_WINDOW: int = 15  # Hawkes peak intensity ring maxlen
+GHOST_VOL_WINDOW: int = 300   # Iceberg tracking window (30s at 100ms)
+
+# ── Phase 6B: Institutional Edge Parameters ──────────────────────────
+HAWKES_MU_0: float = 0.05        # Base intensity
+HAWKES_ALPHA: float = 0.85       # Self-excitation jump size
+HAWKES_BETA: float = 1.20        # Exponential decay rate
 
 # ── Reconnection ────────────────────────────────────────────────────
 RECONNECT_DELAY_INIT: float = 1.0    # seconds

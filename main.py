@@ -58,6 +58,7 @@ from engine.heat_lock import CorrelationHeatLock
 from engine.synthesis import SignalSynthesizer
 from engine.risk import RiskCalculator
 from dispatch.telegram_bot import TelegramSignalDispatcher
+from engine.institutional_edges import InstitutionalEdgeCalculator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,6 +94,7 @@ class SignalBotOrchestrator:
         "risk_calculator",
         "dispatcher",
         "active_signals",
+        "institutional_calculators",
         "_running",
     )
 
@@ -102,6 +104,11 @@ class SignalBotOrchestrator:
         # Phase 1: MicroState per symbol
         self.states: dict[str, SymbolMicroState] = {
             sym: SymbolMicroState(sym) for sym in symbols
+        }
+
+        # Phase 6B: Institutional Alpha Edge Calculators per symbol
+        self.institutional_calculators: dict[str, InstitutionalEdgeCalculator] = {
+            sym: InstitutionalEdgeCalculator(sym) for sym in symbols
         }
 
         # Phase 2 & 4 Vetoes
@@ -178,6 +185,7 @@ class SignalBotOrchestrator:
         elif "aggTrade" in stream:
             symbol = stream.split("@")[0].upper()
             state = self.states.get(symbol)
+            calc = self.institutional_calculators.get(symbol)
             if state is not None:
                 price = float(payload.get("p", 0.0))
                 qty = float(payload.get("q", 0.0))
@@ -185,13 +193,30 @@ class SignalBotOrchestrator:
                 trade_time = int(payload.get("T", now_ms))
                 event_time = payload.get("E")
                 e_int = int(event_time) if event_time is not None else None
+                delta = -qty if is_buyer_maker else qty
 
                 if "timeUnit=MICROSECOND" in stream:
                     # Spot lead-lag trade
+                    state.add_spot_trade_10s(trade_time, delta)
                     state.update_spot_trade(price, qty, is_buyer_maker, trade_time)
+                    if calc is not None:
+                        perp_p = state.last_price if state.last_price > 0.0 else price
+                        calc.update_lead_lag(state, spot_price=price, perp_price=perp_p, now_ms=now_ms)
                 else:
                     # USD-M primary trade (tracks E - T jitter)
+                    state.add_perp_trade_10s(trade_time, delta)
                     state.update_trade(price, qty, is_buyer_maker, trade_time, event_time=e_int)
+
+                    if calc is not None:
+                        spot_p = state.spot_price_ring[-1] if state.spot_price_ring else price
+                        calc.update_lead_lag(state, spot_price=spot_p, perp_price=price, now_ms=now_ms)
+
+                        # Iceberg / Ghost Liquidity tracking
+                        if is_buyer_maker and state.prev_best_bid_qty > 0.0:
+                            calc.update_iceberg(state, qty, state.prev_best_bid_qty, state.best_bid_qty)
+                        elif not is_buyer_maker and state.prev_best_ask_qty > 0.0:
+                            calc.update_iceberg(state, qty, state.prev_best_ask_qty, state.best_ask_qty)
+
                     # Check edge evaluation on trade flow
                     await self._evaluate_symbol_edges(symbol, now_ms)
 
@@ -201,24 +226,41 @@ class SignalBotOrchestrator:
             event = payload.get("o", {})
             sym = event.get("s", "").upper()
             state = self.states.get(sym)
+            calc = self.institutional_calculators.get(sym)
+            qty = float(event.get("q", 0.0))
+            price = float(event.get("p", 0.0))
+            ts = int(payload.get("E", now_ms))
+
             if state is not None:
-                qty = float(event.get("q", 0.0))
-                price = float(event.get("p", 0.0))
                 notional = qty * price
-                ts = int(payload.get("E", now_ms))
                 state.add_liquidation(ts, notional)
                 update_z_liq(state, ts)
+
+            if calc is not None and state is not None:
+                calc.update_hawkes(state, price, qty, ts)
+
+            # COIN-M liquidation (e.g. BTCUSD_PERP)
+            if "_PERP" in sym:
+                base_sym = sym.split("_")[0] + "USDT"
+                c_calc = self.institutional_calculators.get(base_sym)
+                if c_calc is not None:
+                    c_calc.update_coin_m_liquidation(price, qty, ts)
 
         # 5. Kline 1-Minute
         elif "@kline" in stream:
             k = payload.get("k", {})
             sym = k.get("s", "").upper()
             if k.get("x", False):  # On bar close
+                o = float(k.get("o", 0.0))
                 h = float(k.get("h", 0.0))
                 l = float(k.get("l", 0.0))
                 c = float(k.get("c", 0.0))
                 self.smt_detector.update_bar(sym, high=h, low=l, close=c)
                 self.heat_lock.add_price(sym, c)
+
+                calc = self.institutional_calculators.get(sym)
+                if calc is not None:
+                    calc.update_kline(o, h, l, c, funding_rate=0.0)
 
     # ── Signal Synthesis & Execution Pipeline ────────────────────────
 

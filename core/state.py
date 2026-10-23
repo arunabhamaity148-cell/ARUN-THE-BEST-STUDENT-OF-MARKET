@@ -16,6 +16,7 @@ from config import (
     OFI_WINDOW, LIQ_EVENT_WINDOW, ABSORPTION_SNAP_WINDOW,
     TRADE_DELTA_WINDOW,
     SPOT_RING_WINDOW, COINM_OFI_WINDOW, JITTER_WINDOW,
+    HAWKES_PEAK_WINDOW, GHOST_VOL_WINDOW,
 )
 
 
@@ -151,6 +152,16 @@ class SymbolMicroState:
         "spot_price_ring",
         "coin_m_ofi_ring",
         "matching_engine_jitter_ring",
+        # ── Phase 6B: Institutional Edges (Hawkes, Ghost Liquidity, 10s CVD) ──
+        "spot_cvd_10s",
+        "perp_cvd_10s",
+        "hawkes_a",
+        "hawkes_last_ts",
+        "hawkes_peak_ring",
+        "ghost_vol_ring",
+        "exec_vol_ring",
+        "prev_best_bid_qty",
+        "prev_best_ask_qty",
     )
 
     def __init__(self, symbol: str) -> None:
@@ -210,6 +221,17 @@ class SymbolMicroState:
         self.coin_m_ofi_ring: deque = deque(maxlen=COINM_OFI_WINDOW)
         self.matching_engine_jitter_ring: deque = deque(maxlen=JITTER_WINDOW)
 
+        # Phase 6B: Lead-Lag 10s CVD, Hawkes Process & Ghost Liquidity Rings
+        self.spot_cvd_10s: deque = deque(maxlen=1000)
+        self.perp_cvd_10s: deque = deque(maxlen=1000)
+        self.hawkes_a: float = 0.0
+        self.hawkes_last_ts: int = 0
+        self.hawkes_peak_ring: deque = deque(maxlen=HAWKES_PEAK_WINDOW)
+        self.ghost_vol_ring: deque = deque(maxlen=GHOST_VOL_WINDOW)
+        self.exec_vol_ring: deque = deque(maxlen=GHOST_VOL_WINDOW)
+        self.prev_best_bid_qty: float = 0.0
+        self.prev_best_ask_qty: float = 0.0
+
     # ── convenience properties ──────────────────────────────────────
 
     @property
@@ -231,6 +253,8 @@ class SymbolMicroState:
         ask_qty: float,
     ) -> None:
         """Update top-of-book from a bookTicker event."""
+        self.prev_best_bid_qty = self.best_bid_qty
+        self.prev_best_ask_qty = self.best_ask_qty
         self.best_bid = bid
         self.best_bid_qty = bid_qty
         self.best_ask = ask
@@ -325,6 +349,38 @@ class SymbolMicroState:
     def update_coin_m_ofi(self, ofi_val: float) -> None:
         """Record COIN-M OFI reading."""
         self.coin_m_ofi_ring.append(float(ofi_val))
+
+    # ── Phase 6B mutators ─────────────────────────────────────────────
+
+    def add_spot_trade_10s(self, ts_ms: int, delta: float) -> None:
+        """Record spot trade delta for 10s lead-lag tracking."""
+        self.spot_cvd_10s.append((ts_ms, delta))
+
+    def add_perp_trade_10s(self, ts_ms: int, delta: float) -> None:
+        """Record perp trade delta for 10s lead-lag tracking."""
+        self.perp_cvd_10s.append((ts_ms, delta))
+
+    def prune_cvd_10s(self, now_ms: int) -> tuple[float, float]:
+        """Prune entries older than 10s and return (net_spot_10s, net_perp_10s)."""
+        cutoff = now_ms - 10_000
+        if self.spot_cvd_10s and any(ts < cutoff for ts, _ in self.spot_cvd_10s):
+            self.spot_cvd_10s = deque(
+                ((ts, d) for ts, d in self.spot_cvd_10s if ts >= cutoff),
+                maxlen=1000,
+            )
+        if self.perp_cvd_10s and any(ts < cutoff for ts, _ in self.perp_cvd_10s):
+            self.perp_cvd_10s = deque(
+                ((ts, d) for ts, d in self.perp_cvd_10s if ts >= cutoff),
+                maxlen=1000,
+            )
+        spot_net = sum(d for _, d in self.spot_cvd_10s)
+        perp_net = sum(d for _, d in self.perp_cvd_10s)
+        return spot_net, perp_net
+
+    def record_ghost_liquidity(self, ghost_vol: float, exec_vol: float) -> None:
+        """Record ghost replenishment and executed volume for 30s iceberg tracking."""
+        self.ghost_vol_ring.append(float(ghost_vol))
+        self.exec_vol_ring.append(float(exec_vol))
 
     # ── derived metrics ─────────────────────────────────────────────
 
