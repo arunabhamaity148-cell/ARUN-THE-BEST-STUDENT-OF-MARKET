@@ -95,8 +95,9 @@ def compute_kelly_sizing(
     payoff_b: float = KELLY_PAYOFF_B,
     multiplier: float = KELLY_FRACTION_MULTIPLIER,
     cap: float = KELLY_CAP,
+    risk_multiplier: float = 1.0,
 ) -> float:
-    """Calculate quarter-Kelly position fraction: f* = min(cap, mult * (p - (1-p)/b))."""
+    """Calculate quarter-Kelly position fraction: f* = min(cap, mult * (p - (1-p)/b)) * risk_multiplier."""
     p = win_probability
     if p <= 0.0 or payoff_b <= 0.0:
         return 0.0
@@ -105,8 +106,9 @@ def compute_kelly_sizing(
     if raw_kelly <= 0.0:
         return 0.0
 
-    scaled_kelly = multiplier * raw_kelly
-    return min(cap, max(0.0, scaled_kelly))
+    r_mult = max(0.0, risk_multiplier)
+    scaled_kelly = multiplier * raw_kelly * r_mult
+    return min(cap * r_mult, max(0.0, scaled_kelly))
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -139,6 +141,7 @@ class RiskCalculator:
         sweep_price: float,
         atr_14: float,
         win_probability: float,
+        risk_multiplier: float = 1.0,
     ) -> RiskLevels:
         """Compute full risk profile for trade signal.
 
@@ -153,6 +156,8 @@ class RiskCalculator:
             14-period Average True Range.
         win_probability : float
             Bayesian P(Win) from synthesizer.
+        risk_multiplier : float, optional
+            Portfolio scaling multiplier from Spectral Risk Gate (default 1.0).
 
         Returns
         -------
@@ -173,6 +178,7 @@ class RiskCalculator:
             self._payoff_b,
             self._kelly_multiplier,
             self._kelly_cap,
+            risk_multiplier=risk_multiplier,
         )
 
         return RiskLevels(

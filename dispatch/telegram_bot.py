@@ -44,6 +44,7 @@ def format_signal_html(signal: Mapping[str, Any]) -> str:
     """Format trade signal parameters into clean HTML for Telegram.
 
     Uses HTML formatting (bold <b>, code <code>) to avoid MarkdownV2 escaping bugs.
+    Displays 11 institutional order flow edges, Spectral Risk AR, and Kelly sizing.
     """
     symbol = signal.get("symbol", "UNKNOWN")
     direction = signal.get("direction", "LONG").upper()
@@ -58,30 +59,32 @@ def format_signal_html(signal: Mapping[str, Any]) -> str:
     tp2 = signal.get("tp2", 0.0)
     tp3 = signal.get("tp3", 0.0)
     kelly = signal.get("kelly_fraction", 0.0) * 100.0
+    mult = signal.get("risk_multiplier", signal.get("risk_mult", 1.0))
+    ar = signal.get("spectral_ar", signal.get("ar", 0.0))
 
     z_scores = signal.get("z_scores", {})
 
     lines = [
-        "⚡ <b>MICROSTRUCTURE ALPHA SIGNAL</b> ⚡",
+        "🚨 <b>ARUN MARKET ALPHA SIGNAL</b> 🚨",
         "",
-        f"<b>Asset:</b> #{symbol}",
-        f"<b>Direction:</b> {dir_emoji}",
-        f"<b>Bayesian P(Win):</b> <code>{p_win:.1f}%</code>",
+        f"🪙 <b>Asset:</b> #{symbol} | <b>Direction:</b> {dir_emoji}",
+        f"🎯 <b>Bayesian P(Win):</b> <code>{p_win:.1f}%</code> | <b>AR:</b> <code>{ar:.2f}</code>",
         "",
-        f"<b>Entry Price:</b> <code>${entry:,.2f}</code>",
-        f"<b>Stop Loss:</b> <code>${sl:,.2f}</code> (Risk: <code>${risk_r:,.2f}</code>)",
+        f"💰 <b>Entry Price:</b> <code>${entry:,.2f}</code>",
+        f"🛑 <b>Stop Loss:</b> <code>${sl:,.2f}</code> (Risk: <code>${risk_r:,.2f}</code>)",
         "",
-        "<b>Targets:</b>",
+        "🎯 <b>Targets:</b>",
         f"• <b>TP1 (40%):</b> <code>${tp1:,.2f}</code> (+1.5R)",
         f"• <b>TP2 (40%):</b> <code>${tp2:,.2f}</code> (+2.8R)",
         f"• <b>TP3 (20%):</b> <code>${tp3:,.2f}</code> (+4.5R)",
         "",
-        f"<b>Kelly Position Sizing:</b> <code>{kelly:.2f}%</code>",
+        "🛡️ <b>Vetoes:</b> CLEARED (0 Active)",
+        f"⚖️ <b>Kelly Size:</b> <code>{kelly:.2f}%</code> (Mult: <code>{mult:.2f}</code>)",
     ]
 
     if z_scores:
         lines.append("")
-        lines.append("<b>Active Microstructure Edges:</b>")
+        lines.append("🧠 <b>Edge Z-Scores:</b>")
         edge_names = {
             "z_ofi": "L5 OFI",
             "z_cvd": "CVD Absorption",
@@ -89,6 +92,11 @@ def format_signal_html(signal: Mapping[str, Any]) -> str:
             "z_oi": "OI & Basis",
             "z_smt": "SMT Divergence",
             "z_micro": "Micro-Price",
+            "z_hawkes": "Hawkes Cascade",
+            "z_iceberg": "Iceberg / Ghost",
+            "z_lead_lag": "Spot Lead-Lag",
+            "z_coinm_stress": "COIN-M Stress",
+            "z_vr": "Variance Ratio",
         }
         for k, name in edge_names.items():
             if k in z_scores:

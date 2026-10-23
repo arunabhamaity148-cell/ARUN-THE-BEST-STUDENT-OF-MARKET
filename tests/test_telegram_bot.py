@@ -92,6 +92,60 @@ class TestSignalHTMLFormatting:
         assert "CVD Absorption: <code>+2.30</code>" in html
         assert "Liq Exhaustion: <code>+3.42</code>" in html
 
+    def test_format_signal_html_11_edges_and_spectral_ar(self) -> None:
+        signal = {
+            "symbol": "SUIUSDT",
+            "direction": "LONG",
+            "win_probability": 0.845,
+            "entry_price": 1.8540,
+            "stop_loss": 1.8210,
+            "risk_r": 0.0330,
+            "tp1": 1.9035,
+            "tp2": 1.9464,
+            "tp3": 2.0023,
+            "kelly_fraction": 0.0125,
+            "risk_multiplier": 0.85,
+            "spectral_ar": 0.45,
+            "z_scores": {
+                "z_ofi": 2.4,
+                "z_cvd": 2.1,
+                "z_hawkes": 3.2,
+                "z_iceberg": 2.8,
+                "z_lead_lag": 2.6,
+                "z_coinm_stress": 1.8,
+                "z_vr": 1.9,
+            },
+        }
+
+        html = format_signal_html(signal)
+
+        # Header and Asset
+        assert "ARUN MARKET ALPHA SIGNAL" in html
+        assert "<b>Asset:</b> #SUIUSDT" in html
+        assert "🟢 LONG" in html
+
+        # Win prob & Spectral AR
+        assert "<code>84.5%</code>" in html
+        assert "<b>AR:</b> <code>0.45</code>" in html
+
+        # Entry & SL
+        assert "<code>$1.85</code>" in html
+        assert "<code>$1.82</code>" in html
+
+        # Vetoes and Kelly multiplier
+        assert "Vetoes:</b> CLEARED (0 Active)" in html
+        assert "<code>1.25%</code>" in html
+        assert "Mult: <code>0.85</code>" in html
+
+        # 11 institutional edge labels
+        assert "L5 OFI: <code>+2.40</code>" in html
+        assert "CVD Absorption: <code>+2.10</code>" in html
+        assert "Hawkes Cascade: <code>+3.20</code>" in html
+        assert "Iceberg / Ghost: <code>+2.80</code>" in html
+        assert "Spot Lead-Lag: <code>+2.60</code>" in html
+        assert "COIN-M Stress: <code>+1.80</code>" in html
+        assert "Variance Ratio: <code>+1.90</code>" in html
+
 
 class TestTelegramQueueAndRateLimit:
     """Verify queue buffering, intervals, and HTTP 429 retry."""

@@ -147,3 +147,88 @@ class TestSignalSynthesizerEvaluation:
         )
         assert res.win_probability < 0.820
         assert res.is_valid is False
+
+
+class TestElevenEdgeSynthesis:
+    """Verify Phase 6E 11-Edge Bayesian synthesis, weights, thresholds, and veto rules."""
+
+    def test_11_edge_weights_and_thresholds(self) -> None:
+        assert len(EDGE_WEIGHTS) == 11
+        assert len(EDGE_THRESHOLDS) == 11
+        assert pytest.approx(sum(EDGE_WEIGHTS), 1e-6) == 1.0
+        assert pytest.approx(sum(EDGE_WEIGHTS[:6]), 1e-6) == 0.53
+        assert pytest.approx(sum(EDGE_WEIGHTS[6:]), 1e-6) == 0.47
+        assert BETA_0 == -1.8
+        assert MIN_WIN_PROBABILITY == 0.820
+        assert MIN_ACTIVE_EDGES == 4
+
+    def test_11_edge_log_odds_baseline_and_saturation(self) -> None:
+        zeros_11 = (0.0,) * 11
+        assert pytest.approx(compute_log_odds(zeros_11), 1e-6) == -1.8
+
+        fours_11 = (4.0,) * 11
+        # -1.8 + 1.0 * 4.0 = 2.2
+        assert pytest.approx(compute_log_odds(fours_11), 1e-6) == 2.2
+        p_win = compute_win_probability(2.2)
+        assert p_win >= 0.820
+
+    def test_11_edge_activation_counting(self) -> None:
+        # Thresholds: OFI(2.2), CVD(2.0), Liq(3.0), OI(1.8), SMT(1.8), Micro(1.5),
+        #             Hawkes(2.5), Iceberg(2.0), LeadLag(2.5), CM_Stress(2.0), VR(1.5)
+        z_11 = (2.5, 2.1, 0.0, 0.0, 0.0, 0.0, 3.0, 2.2, 0.0, 0.0, 0.0)
+        # Active: OFI, CVD, Hawkes, Iceberg -> 4 active
+        assert count_activated_edges(z_11) == 4
+
+    def test_11_edge_valid_signal_activation(self) -> None:
+        synth = SignalSynthesizer()
+        # High conviction institutional alignment across edges
+        res = synth.synthesize(
+            z_ofi=3.8,
+            z_cvd=3.8,
+            z_liq=3.8,
+            z_oi=3.5,
+            z_smt=3.0,
+            z_micro=3.0,
+            has_active_veto=False,
+            z_hawkes=3.8,
+            z_iceberg=3.8,
+            z_lead_lag=3.8,
+            z_coinm_stress=3.5,
+            z_vr=3.0,
+        )
+        assert res.is_valid is True
+        assert res.active_edge_count >= 4
+        assert res.win_probability >= 0.820
+        assert len(res.z_scores) == 11
+
+    def test_11_edge_insufficient_edges_rejected(self) -> None:
+        synth = SignalSynthesizer()
+        # High scores on only 3 edges (OFI, CVD, Liq), remaining zero
+        res = synth.synthesize(
+            z_ofi=4.0,
+            z_cvd=4.0,
+            z_liq=4.0,
+            z_oi=0.0,
+            z_smt=0.0,
+            z_micro=0.0,
+            has_active_veto=False,
+            z_hawkes=0.0,
+            z_iceberg=0.0,
+            z_lead_lag=0.0,
+            z_coinm_stress=0.0,
+            z_vr=0.0,
+        )
+        # Needs at least 4 active edges in 11-edge model
+        assert res.active_edge_count == 3
+        assert res.is_valid is False
+
+    def test_11_edge_veto_rejection(self) -> None:
+        synth = SignalSynthesizer()
+        # Strong 11-edge alignment but has_active_veto=True
+        res = synth.synthesize(
+            3.8, 3.8, 3.8, 3.5, 3.0, 3.0, 3.8, 3.8, 3.8, 3.5, 3.0,
+            has_active_veto=True,
+        )
+        assert res.win_probability >= 0.820
+        assert res.active_edge_count >= 4
+        assert res.is_valid is False

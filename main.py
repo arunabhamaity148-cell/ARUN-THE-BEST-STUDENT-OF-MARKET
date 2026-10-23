@@ -58,7 +58,11 @@ from engine.heat_lock import CorrelationHeatLock
 from engine.synthesis import SignalSynthesizer
 from engine.risk import RiskCalculator
 from dispatch.telegram_bot import TelegramSignalDispatcher
-from engine.institutional_edges import InstitutionalEdgeCalculator, compute_variance_ratio
+from engine.institutional_edges import (
+    InstitutionalEdgeCalculator,
+    compute_variance_ratio,
+    compute_iceberg_ratio,
+)
 from engine.spectral_risk import PurePythonSpectralRiskEngine
 from engine.deribit_dvol import DeribitDVOLVeto
 from engine.alt_data_veto import AltDataVetoEngine
@@ -317,8 +321,70 @@ class SignalBotOrchestrator:
         )
         z_micro = max(-4.0, min(4.0, micro_bps / 2.0))
 
-        # Trigger Threshold: only trigger REST confirmation if OFI or CVD shows edge
-        if abs(z_ofi) < 2.0 and abs(z_cvd) < 1.8 and z_liq < 2.5:
+        calc = self.institutional_calculators.get(symbol)
+
+        # Hawkes Process (Edge 7)
+        if state.hawkes_peak_ring:
+            peak_h = max(state.hawkes_peak_ring)
+            z_hawkes = max(-4.0, min(4.0, (peak_h / 0.05) * 0.1))
+        else:
+            z_hawkes = 0.0
+
+        # Iceberg / Ghost Liquidity (Edge 8)
+        ghost_sum = sum(state.ghost_vol_ring)
+        exec_sum = sum(state.exec_vol_ring)
+        g_t = compute_iceberg_ratio(ghost_sum, exec_sum)
+        z_vol = calc.agg_vol_30s_normalizer.z_score(exec_sum) if calc is not None else 0.0
+        if g_t >= 0.68 and z_vol > 0.0:
+            z_iceberg = max(-4.0, min(4.0, max(z_vol, g_t * 3.5)))
+        elif g_t > 0.0:
+            z_iceberg = max(-4.0, min(4.0, g_t * 3.0))
+        else:
+            z_iceberg = 0.0
+
+        # Spot-to-Perp Lead-Lag (Edge 9)
+        if calc is not None:
+            spot_p = state.spot_price_ring[-1] if state.spot_price_ring else state.mid_price
+            perp_p = state.mid_price
+            score_lead, _ = calc.update_lead_lag(state, spot_p, perp_p, now_ms)
+            z_lead_lag = max(-4.0, min(4.0, score_lead))
+        else:
+            z_lead_lag = 0.0
+
+        # Cross-Margined Collateral Stress (Edge 10)
+        if calc is not None:
+            psi_stress, _, _ = calc.compute_collateral_stress(
+                bid_cm=state.best_bid, ask_cm=state.best_ask,
+                bid_qty_cm=state.best_bid_qty, ask_qty_cm=state.best_ask_qty,
+                bid_um=state.best_bid, ask_um=state.best_ask,
+                bid_qty_um=state.best_bid_qty, ask_qty_um=state.best_ask_qty,
+            )
+            z_coinm_stress = max(-4.0, min(4.0, psi_stress))
+        else:
+            z_coinm_stress = 0.0
+
+        # Variance Ratio (Edge 11)
+        vr = 1.0
+        if calc is not None and len(calc.kline_closes) >= 7:
+            vr = compute_variance_ratio(calc.kline_closes)
+            if vr >= 1.18:
+                z_vr = max(-4.0, min(4.0, (vr - 1.0) * 8.0))
+            elif vr <= 0.85:
+                z_vr = max(-4.0, min(4.0, (1.0 - vr) * 8.0))
+            else:
+                z_vr = max(-4.0, min(4.0, abs(vr - 1.0) * 5.0))
+        else:
+            z_vr = 0.0
+
+        # Trigger Threshold: only trigger REST confirmation if any major edge activates
+        if (
+            abs(z_ofi) < 2.0
+            and abs(z_cvd) < 1.8
+            and z_liq < 2.5
+            and z_hawkes < 2.5
+            and z_iceberg < 2.0
+            and abs(z_lead_lag) < 2.5
+        ):
             return
 
         # 2. Lazy On-Demand REST Confirmation
@@ -330,7 +396,7 @@ class SignalBotOrchestrator:
         # 3. SMT Divergence
         # Evaluate vs BTC (if ETH or SOL)
         z_smt = 0.0
-        direction = "LONG" if z_ofi > 0 else "SHORT"
+        direction = "LONG" if (z_ofi > 0 or (z_ofi == 0.0 and z_lead_lag >= 0.0)) else "SHORT"
         if symbol != "BTCUSDT" and "BTCUSDT" in self.states:
             btc_price = self.states["BTCUSDT"].mid_price
             curr_price = state.mid_price
@@ -350,12 +416,7 @@ class SignalBotOrchestrator:
         cand_dir = 1 if direction == "LONG" else -1
 
         # Determine strategy type (BREAKOUT vs MEAN_REVERSION) from variance ratio
-        strategy_type = "BREAKOUT"
-        calc = self.institutional_calculators.get(symbol)
-        if calc is not None and len(calc.kline_closes) >= 7:
-            vr = compute_variance_ratio(calc.kline_closes)
-            if vr <= 0.85:
-                strategy_type = "MEAN_REVERSION"
+        strategy_type = "MEAN_REVERSION" if vr <= 0.85 else "BREAKOUT"
 
         # Evaluate Spectral Risk Gate (AR, heat cap, Mantegna distance, eigen-beta sizing)
         spectral_approved, risk_mult, gate_reason = self.spectral_risk.evaluate_portfolio_risk_gate(
@@ -393,7 +454,7 @@ class SignalBotOrchestrator:
             or (direction == "LONG" and self.alt_data_veto.is_stablecoin_draining(symbol))
         )
 
-        # 5. Bayesian Synthesis
+        # 5. Bayesian Synthesis (11 Institutional Edges)
         eval_z = (
             z_ofi if direction == "LONG" else -z_ofi,
             z_cvd if direction == "LONG" else -z_cvd,
@@ -401,6 +462,11 @@ class SignalBotOrchestrator:
             z_oi if direction == "LONG" else -z_oi,
             z_smt,
             z_micro if direction == "LONG" else -z_micro,
+            z_hawkes,
+            z_iceberg,
+            z_lead_lag if direction == "LONG" else -z_lead_lag,
+            z_coinm_stress if direction == "LONG" else -z_coinm_stress,
+            z_vr,
         )
 
         synthesis = self.synthesizer.synthesize(
@@ -420,10 +486,10 @@ class SignalBotOrchestrator:
                 sweep_price=sweep,
                 atr_14=atr,
                 win_probability=synthesis.win_probability,
+                risk_multiplier=risk_mult,
             )
 
-            # Scale Kelly fraction by Spectral Risk Gate risk_mult
-            scaled_kelly = risk.kelly_fraction * risk_mult
+            scaled_kelly = risk.kelly_fraction
 
             signal_payload = {
                 "symbol": symbol,
@@ -445,6 +511,11 @@ class SignalBotOrchestrator:
                     "z_oi": z_oi,
                     "z_smt": z_smt,
                     "z_micro": z_micro,
+                    "z_hawkes": z_hawkes,
+                    "z_iceberg": z_iceberg,
+                    "z_lead_lag": z_lead_lag,
+                    "z_coinm_stress": z_coinm_stress,
+                    "z_vr": z_vr,
                 },
             }
 
