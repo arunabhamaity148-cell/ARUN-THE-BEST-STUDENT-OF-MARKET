@@ -58,7 +58,8 @@ from engine.heat_lock import CorrelationHeatLock
 from engine.synthesis import SignalSynthesizer
 from engine.risk import RiskCalculator
 from dispatch.telegram_bot import TelegramSignalDispatcher
-from engine.institutional_edges import InstitutionalEdgeCalculator
+from engine.institutional_edges import InstitutionalEdgeCalculator, compute_variance_ratio
+from engine.spectral_risk import PurePythonSpectralRiskEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,7 +95,10 @@ class SignalBotOrchestrator:
         "risk_calculator",
         "dispatcher",
         "active_signals",
+        "active_positions",
         "institutional_calculators",
+        "spectral_risk",
+        "last_kline_closes",
         "_running",
     )
 
@@ -110,6 +114,13 @@ class SignalBotOrchestrator:
         self.institutional_calculators: dict[str, InstitutionalEdgeCalculator] = {
             sym: InstitutionalEdgeCalculator(sym) for sym in symbols
         }
+
+        # Phase 6C: Pure-Python Spectral Risk & Mantegna Clustering Engine
+        self.spectral_risk: PurePythonSpectralRiskEngine = (
+            PurePythonSpectralRiskEngine(symbols=symbols)
+        )
+        self.active_positions: dict[str, int] = {}
+        self.last_kline_closes: dict[str, float] = {}
 
         # Phase 2 & 4 Vetoes
         self.spoofing_veto: SpoofingQuoteFlickerVeto = SpoofingQuoteFlickerVeto()
@@ -258,6 +269,13 @@ class SignalBotOrchestrator:
                 self.smt_detector.update_bar(sym, high=h, low=l, close=c)
                 self.heat_lock.add_price(sym, c)
 
+                # Update 1m log-returns into Pure-Python Spectral Risk Engine
+                prev_c = self.last_kline_closes.get(sym, c)
+                self.last_kline_closes[sym] = c
+                if prev_c > 0.0 and c > 0.0:
+                    ret_1m = math.log(c / prev_c)
+                    self.spectral_risk.update_returns_1m({sym: ret_1m})
+
                 calc = self.institutional_calculators.get(sym)
                 if calc is not None:
                     calc.update_kline(o, h, l, c, funding_rate=0.0)
@@ -321,6 +339,23 @@ class SignalBotOrchestrator:
         # 4. Veto Matrix Evaluation
         is_counter_trend = (z_cvd * (1 if direction == "LONG" else -1)) > 0
         now_s = now_ms / 1000.0
+        cand_dir = 1 if direction == "LONG" else -1
+
+        # Determine strategy type (BREAKOUT vs MEAN_REVERSION) from variance ratio
+        strategy_type = "BREAKOUT"
+        calc = self.institutional_calculators.get(symbol)
+        if calc is not None and len(calc.kline_closes) >= 7:
+            vr = compute_variance_ratio(calc.kline_closes)
+            if vr <= 0.85:
+                strategy_type = "MEAN_REVERSION"
+
+        # Evaluate Spectral Risk Gate (AR, heat cap, Mantegna distance, eigen-beta sizing)
+        spectral_approved, risk_mult, gate_reason = self.spectral_risk.evaluate_portfolio_risk_gate(
+            candidate_sym=symbol,
+            candidate_dir=cand_dir,
+            strategy_type=strategy_type,
+            active_positions=self.active_positions,
+        )
 
         # Check all guards
         has_veto = (
@@ -342,7 +377,7 @@ class SignalBotOrchestrator:
                 next_funding_time_ms=self.rest_engine.get_next_funding_time(symbol),
                 now_ms=now_ms,
             )
-            or self.heat_lock.should_veto(symbol, self.active_signals)
+            or (not spectral_approved)
         )
 
         # 5. Bayesian Synthesis
@@ -374,6 +409,9 @@ class SignalBotOrchestrator:
                 win_probability=synthesis.win_probability,
             )
 
+            # Scale Kelly fraction by Spectral Risk Gate risk_mult
+            scaled_kelly = risk.kelly_fraction * risk_mult
+
             signal_payload = {
                 "symbol": symbol,
                 "direction": direction,
@@ -384,7 +422,9 @@ class SignalBotOrchestrator:
                 "tp1": risk.tp1,
                 "tp2": risk.tp2,
                 "tp3": risk.tp3,
-                "kelly_fraction": risk.kelly_fraction,
+                "kelly_fraction": scaled_kelly,
+                "risk_multiplier": risk_mult,
+                "spectral_ar": self.spectral_risk.absorption_ratio,
                 "z_scores": {
                     "z_ofi": z_ofi,
                     "z_cvd": z_cvd,
@@ -395,8 +435,12 @@ class SignalBotOrchestrator:
                 },
             }
 
-            logger.info("VALID SIGNAL TRIGGERED: %s %s P(Win)=%.3f", symbol, direction, synthesis.win_probability)
+            logger.info(
+                "VALID SIGNAL TRIGGERED: %s %s P(Win)=%.3f Kelly=%.4f (mult=%.2f, reason=%s)",
+                symbol, direction, synthesis.win_probability, scaled_kelly, risk_mult, gate_reason,
+            )
             self.active_signals.add(symbol)
+            self.active_positions[symbol] = cand_dir
             await self.dispatcher.enqueue_signal(signal_payload)
 
     # ── Lifecycle ───────────────────────────────────────────────────
