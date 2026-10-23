@@ -14,6 +14,8 @@ Both classes use ``__slots__`` and operate purely on the in-memory
 """
 
 
+from core.state import OnlineNormalizer
+
 # ─────────────────────────────────────────────────────────────────────
 # Pre-computed Constants
 # ─────────────────────────────────────────────────────────────────────
@@ -29,6 +31,10 @@ NEUTRAL_FUNDING_MAX: float = 0.0001        # ±0.01% in decimal
 DELEVERAGING_ZLIQ_OVERRIDE: float = 3.5    # Z_liq > 3.5 overrides deleveraging veto
 FUNDING_BOUNDARY_MS: int = 5 * 60 * 1000   # ±5 minutes around settlement
 EXTREME_FUNDING_THRESHOLD: float = 0.0005  # ±0.05% in decimal
+
+# Phase 4 Veto Constants
+MAX_SPREAD_BPS_THRESHOLD: float = 3.5      # max allowed spread in bps
+DEPTH_VACUUM_STD_MULT: float = 1.5         # depth drop threshold: mean - 1.5 * std
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -374,4 +380,87 @@ class FundingSettlementBoundaryVeto:
             f"FundingSettlementBoundaryVeto("
             f"extreme_threshold={self._extreme_funding_threshold}, "
             f"boundary_ms={self._boundary_ms})"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 5.  Phase 4: Liquidity Vacuum Veto
+# ─────────────────────────────────────────────────────────────────────
+
+def calculate_spread_bps(bid: float, ask: float) -> float:
+    """Calculate spread in basis points: ((ask - bid) / mid) * 10000."""
+    mid = (ask + bid) / 2.0
+    if mid <= 0.0:
+        return 0.0
+    return ((ask - bid) / mid) * 10000.0
+
+
+def compute_top5_depth_notional(bids: list, asks: list) -> float:
+    """Sum notional depth across the top 5 bid and ask levels."""
+    d5 = 0.0
+    for i in range(min(5, len(bids))):
+        d5 += float(bids[i][0]) * float(bids[i][1])
+    for i in range(min(5, len(asks))):
+        d5 += float(asks[i][0]) * float(asks[i][1])
+    return d5
+
+
+class LiquidityVacuumVeto:
+    """Vetoes signals during order book liquidity vacuums or spread blowouts.
+
+    Rules:
+    1. Spread Veto: S_bps = ((ask - bid) / mid) * 10000. If S_bps > 3.5, veto.
+    2. Depth Veto: D_5 < (mean_D5 - 1.5 * std_D5), veto (protects against thin book).
+    """
+
+    __slots__ = (
+        "_max_spread_bps",
+        "_std_mult",
+        "_depth_normalizer",
+    )
+
+    def __init__(
+        self,
+        max_spread_bps: float = MAX_SPREAD_BPS_THRESHOLD,
+        depth_std_mult: float = DEPTH_VACUUM_STD_MULT,
+    ) -> None:
+        self._max_spread_bps: float = max_spread_bps
+        self._std_mult: float = depth_std_mult
+        self._depth_normalizer: OnlineNormalizer = OnlineNormalizer()
+
+    def update_depth(self, d5: float) -> None:
+        """Incorporate a new D_5 reading into the streaming normalizer."""
+        self._depth_normalizer.update(d5)
+
+    def should_veto_spread(self, bid: float, ask: float) -> bool:
+        """Return True if current spread in bps exceeds threshold (3.5 bps)."""
+        s_bps = calculate_spread_bps(bid, ask)
+        return s_bps > self._max_spread_bps
+
+    def should_veto_depth(self, d5: float) -> bool:
+        """Return True if D_5 falls below mean - 1.5 * std."""
+        if self._depth_normalizer.count < 2:
+            return False
+
+        std = self._depth_normalizer.std_dev
+        if std < 1e-12:
+            return False
+
+        vacuum_threshold = self._depth_normalizer.mean - (self._std_mult * std)
+        return d5 < vacuum_threshold
+
+    def should_veto(self, bid: float, ask: float, d5: float | None = None) -> bool:
+        """Return True if either spread or depth vacuum condition is triggered."""
+        if self.should_veto_spread(bid, ask):
+            return True
+
+        if d5 is not None and self.should_veto_depth(d5):
+            return True
+
+        return False
+
+    def __repr__(self) -> str:
+        return (
+            f"LiquidityVacuumVeto(max_spread_bps={self._max_spread_bps}, "
+            f"std_mult={self._std_mult}, depth_count={self._depth_normalizer.count})"
         )

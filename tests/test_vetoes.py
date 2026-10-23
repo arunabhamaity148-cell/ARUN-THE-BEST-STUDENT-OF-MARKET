@@ -15,6 +15,7 @@ Verifies:
 
 import sys
 import os
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -29,10 +30,15 @@ from engine.vetoes import (
     DELEVERAGING_ZLIQ_OVERRIDE,
     FUNDING_BOUNDARY_MS,
     EXTREME_FUNDING_THRESHOLD,
+    MAX_SPREAD_BPS_THRESHOLD,
+    DEPTH_VACUUM_STD_MULT,
     SpoofingQuoteFlickerVeto,
     FlashCrashKnifeCatchVeto,
     DeleveragingVeto,
     FundingSettlementBoundaryVeto,
+    LiquidityVacuumVeto,
+    calculate_spread_bps,
+    compute_top5_depth_notional,
 )
 
 
@@ -439,4 +445,76 @@ class TestFundingSettlementBoundaryVetoLogic:
             next_funding_time_ms=0,
             now_ms=1000,
         ) is False
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 5. LiquidityVacuumVeto
+# ─────────────────────────────────────────────────────────────────────
+
+class TestLiquidityVacuumVetoSlots:
+    """Verify slots enforcement."""
+
+    def test_has_slots(self) -> None:
+        assert hasattr(LiquidityVacuumVeto, "__slots__")
+
+    def test_no_dict(self) -> None:
+        veto = LiquidityVacuumVeto()
+        assert not hasattr(veto, "__dict__")
+
+    def test_repr(self) -> None:
+        veto = LiquidityVacuumVeto()
+        r = repr(veto)
+        assert "LiquidityVacuumVeto" in r
+
+
+class TestLiquidityVacuumVetoLogic:
+    """Verify spread blowout and order book depth vacuum rules."""
+
+    def test_calculate_spread_bps(self) -> None:
+        # mid = 100.0, diff = 0.05 -> ((0.05) / 100) * 10000 = 5.0 bps
+        s_bps = calculate_spread_bps(bid=99.975, ask=100.025)
+        assert pytest.approx(s_bps, 1e-6) == 5.0
+
+    def test_compute_top5_depth_notional(self) -> None:
+        bids = [["100.0", "1.0"], ["99.0", "2.0"]]
+        asks = [["101.0", "1.0"], ["102.0", "3.0"]]
+        # Bids: 100*1 + 99*2 = 298
+        # Asks: 101*1 + 102*3 = 407
+        # Total: 705.0
+        d5 = compute_top5_depth_notional(bids, asks)
+        assert pytest.approx(d5, 1e-6) == 705.0
+
+    def test_spread_blowout_veto(self) -> None:
+        veto = LiquidityVacuumVeto(max_spread_bps=3.5)
+        # Spread = 4.0 bps > 3.5 bps -> VETOED
+        # mid = 100.0, diff = 0.04 -> 4.0 bps
+        assert veto.should_veto_spread(bid=99.98, ask=100.02) is True
+        assert veto.should_veto(bid=99.98, ask=100.02) is True
+
+    def test_normal_spread_allowed(self) -> None:
+        veto = LiquidityVacuumVeto(max_spread_bps=3.5)
+        # Spread = 2.0 bps <= 3.5 bps -> ALLOWED
+        assert veto.should_veto_spread(bid=99.99, ask=100.01) is False
+        assert veto.should_veto(bid=99.99, ask=100.01) is False
+
+    def test_depth_vacuum_veto(self) -> None:
+        veto = LiquidityVacuumVeto(depth_std_mult=1.5)
+
+        # Feed steady baseline: mean ~ 1,000,000, std ~ 20,000
+        for i in range(50):
+            veto.update_depth(1_000_000.0 + (i % 5 - 2) * 20_000.0)
+
+        # Normal depth: 980,000 -> allowed
+        assert veto.should_veto_depth(980_000.0) is False
+
+        # Severe depth vacuum: 500,000 (well below mean - 1.5 * std) -> VETOED
+        assert veto.should_veto_depth(500_000.0) is True
+        assert veto.should_veto(bid=99.99, ask=100.01, d5=500_000.0) is True
+
+    def test_insufficient_depth_history_allowed(self) -> None:
+        veto = LiquidityVacuumVeto()
+        # Only 1 sample in baseline -> depth veto not yet active
+        veto.update_depth(1_000_000.0)
+        assert veto.should_veto_depth(100_000.0) is False
+
 
