@@ -141,6 +141,7 @@ class AltDataVetoEngine:
     __slots__ = (
         "chain_24h_changes",
         "symbol_to_chain",
+        "prev_circulating",
         "last_poll_ts",
         "cache_file",
         "is_jitter_vetoed",
@@ -154,6 +155,7 @@ class AltDataVetoEngine:
     def __init__(self, cache_dir: str | None = None) -> None:
         self.chain_24h_changes: dict[str, float] = {}
         self.symbol_to_chain: dict[str, str] = dict(SYMBOL_TO_CHAIN)
+        self.prev_circulating: dict[str, float] = {}
         self.last_poll_ts: float = 0.0
 
         # Safe cache file path
@@ -193,6 +195,7 @@ class AltDataVetoEngine:
                 with open(self.cache_file, "rb") as f:
                     data = orjson.loads(f.read())
                     saved_ts = data.get("ts", 0)
+                    self.prev_circulating = data.get("prev_circulating", {})
                     if time.time() - saved_ts < STABLECOIN_POLL_INTERVAL:
                         self.chain_24h_changes = data.get("changes", {})
                         self.last_poll_ts = saved_ts
@@ -200,11 +203,12 @@ class AltDataVetoEngine:
             logger.debug("Could not load stablecoin cache: %s", exc)
 
     def _save_cache(self) -> None:
-        """Persist current chain changes to disk."""
+        """Persist current chain changes and circulating supply to disk."""
         try:
             payload = {
                 "ts": self.last_poll_ts,
                 "changes": self.chain_24h_changes,
+                "prev_circulating": self.prev_circulating,
             }
             with open(self.cache_file, "wb") as f:
                 f.write(orjson.dumps(payload))
@@ -217,43 +221,100 @@ class AltDataVetoEngine:
         if now - self.last_poll_ts < STABLECOIN_POLL_INTERVAL and self.chain_24h_changes:
             return
 
+        session = self._session or aiohttp.ClientSession()
         try:
-            session = self._session or aiohttp.ClientSession()
             timeout = aiohttp.ClientTimeout(total=10)
             async with session.get(DEFILLAMA_CHAINS_URL, timeout=timeout) as resp:
-                if resp.status == 200:
-                    raw_bytes = await resp.read()
-                    data = orjson.loads(raw_bytes)
+                if resp.status != 200:
+                    logger.warning("DefiLlama API returned HTTP %d", resp.status)
+                    return
 
-                    for item in data:
-                        name = item.get("name", "")
-                        if not name:
+                raw_bytes = await resp.read()
+                try:
+                    data = orjson.loads(raw_bytes)
+                except Exception as json_err:
+                    logger.error(
+                        "Failed to decode DefiLlama JSON: %s (raw sample: %s)",
+                        json_err,
+                        raw_bytes[:300],
+                    )
+                    return
+
+                if not isinstance(data, list):
+                    logger.warning("DefiLlama API returned non-list response: %s", type(data))
+                    return
+
+                parsed_count = 0
+                for item in data:
+                    try:
+                        name = item.get("name") or item.get("gecko_id") or item.get("chain", "")
+                        if not name or not isinstance(name, str):
                             continue
 
-                        # Extract 24h change
+                        name_clean = name.strip()
+                        name_key = name_clean.lower()
+
+                        # 1. Direct 24h change fields (if returned by API or mock)
                         change_1d = None
                         if "change_1d" in item and item["change_1d"] is not None:
                             change_1d = float(item["change_1d"])
                         elif "change_24h" in item and item["change_24h"] is not None:
                             change_1d = float(item["change_24h"])
-                        elif "totalCirculatingUSD" in item and "totalCirculatingUSDPrevDay" in item:
-                            curr = float(item.get("totalCirculatingUSD", {}).get("peggedUSD", 0.0))
-                            prev = float(item.get("totalCirculatingUSDPrevDay", {}).get("peggedUSD", 0.0))
-                            if prev > 0.0:
-                                change_1d = ((curr - prev) / prev) * 100.0
+                        elif "totalCirculatingUSDPrevDay" in item:
+                            tot_curr = item.get("totalCirculatingUSD")
+                            tot_prev = item.get("totalCirculatingUSDPrevDay")
+                            curr_val = (
+                                float(tot_curr.get("peggedUSD", 0.0))
+                                if isinstance(tot_curr, dict)
+                                else float(tot_curr or 0.0)
+                            )
+                            prev_val = (
+                                float(tot_prev.get("peggedUSD", 0.0))
+                                if isinstance(tot_prev, dict)
+                                else float(tot_prev or 0.0)
+                            )
+                            if prev_val > 0.0:
+                                change_1d = ((curr_val - prev_val) / prev_val) * 100.0
+
+                        # 2. Extract from totalCirculatingUSD against rolling cached supply
+                        if change_1d is None and "totalCirculatingUSD" in item:
+                            tot = item.get("totalCirculatingUSD")
+                            curr_circ = 0.0
+                            if isinstance(tot, dict):
+                                curr_circ = float(tot.get("peggedUSD", 0.0))
+                            elif isinstance(tot, (int, float)):
+                                curr_circ = float(tot)
+
+                            if curr_circ > 0.0:
+                                prev_circ = self.prev_circulating.get(name_key)
+                                if prev_circ is not None and prev_circ > 0.0:
+                                    change_1d = ((curr_circ - prev_circ) / prev_circ) * 100.0
+                                else:
+                                    change_1d = 0.0
+                                self.prev_circulating[name_key] = curr_circ
 
                         if change_1d is not None:
-                            self.chain_24h_changes[name.lower()] = change_1d
+                            self.chain_24h_changes[name_key] = change_1d
+                            parsed_count += 1
 
-                    self.last_poll_ts = now
-                    self._save_cache()
-                    logger.info("Updated DefiLlama stablecoin 24h changes for %d chains", len(self.chain_24h_changes))
+                    except Exception as item_err:
+                        logger.debug("Failed parsing chain item %s: %s", item, item_err)
+                        continue
 
-            if self._session is None:
-                await session.close()
+                self.last_poll_ts = now
+                self._save_cache()
+                logger.info(
+                    "Updated DefiLlama stablecoin 24h changes for %d chains (parsed %d)",
+                    len(self.chain_24h_changes),
+                    parsed_count,
+                )
 
         except Exception as exc:
+            logger.error("Failed fetching DefiLlama stablecoins: %s", exc)
             logger.warning("DefiLlama stablecoins poll failed (%s) — using cached data", exc)
+        finally:
+            if self._session is None:
+                await session.close()
 
     # ── 2. US Spot ETF AP Window Veto ──────────────────────────────────
 

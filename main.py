@@ -218,7 +218,12 @@ class SignalBotOrchestrator:
                 e_int = int(event_time) if event_time is not None else None
                 delta = -qty if is_buyer_maker else qty
 
-                if "timeUnit=MICROSECOND" in stream:
+                is_spot = (
+                    "timeUnit=MICROSECOND" in stream
+                    or data.get("_source") == "spot"
+                    or trade_time > 10**14
+                )
+                if is_spot:
                     # Spot lead-lag trade
                     state.add_spot_trade_10s(trade_time, delta)
                     state.update_spot_trade(price, qty, is_buyer_maker, trade_time)

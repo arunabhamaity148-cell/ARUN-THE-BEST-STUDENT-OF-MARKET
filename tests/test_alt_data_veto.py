@@ -181,6 +181,65 @@ class TestDefiLlamaStablecoins:
         assert engine.is_stablecoin_draining("AVAXUSDT") is True
         assert engine.is_stablecoin_draining("SUIUSDT") is False
 
+    @pytest.mark.asyncio
+    async def test_fetch_defillama_live_schema_mock(self) -> None:
+        """Test DefiLlama's actual production schema: list of {'name': ..., 'totalCirculatingUSD': {'peggedUSD': ...}}."""
+        engine = AltDataVetoEngine()
+
+        # Frame 1: Baseline supply
+        payload_1 = (
+            b'[{"name": "Sui", "totalCirculatingUSD": {"peggedUSD": 500000000.0}},'
+            b' {"name": "Solana", "totalCirculatingUSD": {"peggedUSD": 10000000000.0}},'
+            b' {"name": "Near", "gecko_id": "near", "totalCirculatingUSD": {"peggedUSD": 200000000.0}}]'
+        )
+        mock_resp1 = AsyncMock()
+        mock_resp1.status = 200
+        mock_resp1.read = AsyncMock(return_value=payload_1)
+        mock_resp1.__aenter__.return_value = mock_resp1
+        mock_resp1.__aexit__.return_value = False
+
+        mock_session1 = MagicMock()
+        mock_session1.get.return_value = mock_resp1
+        mock_session1.close = AsyncMock()
+
+        with patch("aiohttp.ClientSession", return_value=mock_session1):
+            engine.last_poll_ts = 0.0
+            await engine.fetch_defillama_data()
+
+        # All 3 chains parsed successfully on baseline
+        assert "sui" in engine.chain_24h_changes
+        assert "solana" in engine.chain_24h_changes
+        assert "near" in engine.chain_24h_changes
+        assert engine.chain_24h_changes["solana"] == 0.0
+        assert engine.is_stablecoin_draining("SOLUSDT") is False
+
+        # Frame 2: Solana supply drains by 3.0% (10.0B -> 9.7B), Sui increases (+4.0%)
+        payload_2 = (
+            b'[{"name": "Sui", "totalCirculatingUSD": {"peggedUSD": 520000000.0}},'
+            b' {"name": "Solana", "totalCirculatingUSD": {"peggedUSD": 9700000000.0}}]'
+        )
+        mock_resp2 = AsyncMock()
+        mock_resp2.status = 200
+        mock_resp2.read = AsyncMock(return_value=payload_2)
+        mock_resp2.__aenter__.return_value = mock_resp2
+        mock_resp2.__aexit__.return_value = False
+
+        mock_session2 = MagicMock()
+        mock_session2.get.return_value = mock_resp2
+        mock_session2.close = AsyncMock()
+
+        with patch("aiohttp.ClientSession", return_value=mock_session2):
+            engine.last_poll_ts = 0.0  # Force update
+            await engine.fetch_defillama_data()
+
+        assert engine.chain_24h_changes["solana"] == pytest.approx(-3.0)
+        assert engine.chain_24h_changes["sui"] == pytest.approx(4.0)
+
+        # Solana veto triggers (change <= -1.5%)
+        assert engine.is_stablecoin_draining("SOLUSDT") is True
+        # Sui is healthy
+        assert engine.is_stablecoin_draining("SUIUSDT") is False
+
 
 # ─────────────────────────────────────────────────────────────────────
 # 3. US Spot ETF AP Rebalance Window Veto

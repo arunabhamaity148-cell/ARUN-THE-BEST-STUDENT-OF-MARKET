@@ -145,11 +145,24 @@ class TestWSManagerInit:
     # ── 2. Spot Socket URL ──
     def test_spot_url_contains_expected_streams(self) -> None:
         mgr = WSManager(symbols=("BTCUSDT", "ETHUSDT"))
-        assert "btcusdt@aggTrade?timeUnit=MICROSECOND" in mgr.spot_url
+        assert "btcusdt@aggTrade" in mgr.spot_url
         assert "btcusdt@bookTicker" in mgr.spot_url
-        assert "ethusdt@aggTrade?timeUnit=MICROSECOND" in mgr.spot_url
+        assert "ethusdt@aggTrade" in mgr.spot_url
         assert "ethusdt@bookTicker" in mgr.spot_url
         assert "stream.binance.com:9443" in mgr.spot_url
+        assert mgr.spot_url.endswith("&timeUnit=MICROSECOND")
+        assert "?timeUnit=MICROSECOND" not in mgr.spot_url
+
+    def test_spot_url_exact_format(self) -> None:
+        mgr = WSManager(symbols=("BTCUSDT",))
+        expected = (
+            "wss://stream.binance.com:9443/stream?streams="
+            "btcusdt@aggTrade/btcusdt@bookTicker&timeUnit=MICROSECOND"
+        )
+        assert mgr.spot_url == expected
+        assert not mgr.spot_url.endswith(" ")
+        assert mgr.spot_url.count("?") == 1
+        assert "BTCUSDT" not in mgr.spot_url
 
     # ── 3. COIN-M Socket URL ──
     def test_coinm_url_contains_expected_streams(self) -> None:

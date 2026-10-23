@@ -140,18 +140,24 @@ class WSManager:
         self._public_url: str = self._usdm_url
         self._market_url: str = self._usdm_url
 
-        # 2. Spot Socket: @aggTrade (?timeUnit=MICROSECOND) and @bookTicker
+        # 2. Spot Socket: @aggTrade and @bookTicker with &timeUnit=MICROSECOND
         spot_names: list[str] = []
         for sym in symbols:
-            s_low = sym.lower()
-            spot_names.append(f"{s_low}@aggTrade?timeUnit=MICROSECOND")
+            s_low = sym.lower().strip()
+            spot_names.append(f"{s_low}@aggTrade")
             spot_names.append(f"{s_low}@bookTicker")
 
-        self._spot_url: str = build_stream_url(spot_base_url, spot_names)
+        base_spot = spot_base_url.strip()
+        combined_spot = build_stream_url(base_spot, spot_names)
+        if "timeUnit=" not in combined_spot:
+            sep = "&" if "?" in combined_spot else "?"
+            self._spot_url: str = f"{combined_spot}{sep}timeUnit=MICROSECOND".strip()
+        else:
+            self._spot_url: str = combined_spot.strip()
 
         # 3. COIN-M Socket: !bookTicker and !forceOrder@arr
         coinm_names: list[str] = ["!bookTicker", "!forceOrder@arr"]
-        self._coinm_url: str = build_stream_url(coinm_base_url, coinm_names)
+        self._coinm_url: str = build_stream_url(coinm_base_url.strip(), coinm_names).strip()
 
         self._running: bool = False
         self._tasks: list[asyncio.Task] = []
@@ -195,6 +201,8 @@ class WSManager:
                         # Binance sends text frames so websockets may
                         # hand us a str — we never call .decode().
                         data: dict = orjson.loads(raw)
+                        if isinstance(data, dict):
+                            data["_source"] = label
                         await self._on_message(data)
 
             except asyncio.CancelledError:
